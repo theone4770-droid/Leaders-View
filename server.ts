@@ -111,28 +111,35 @@ async function fetchSingleMirror<T>(base: string, endpointPath: string, timeoutM
   }
 }
 
+let fapiFuturesBlockedUntil = 0;
+
 async function fetchBinanceFuturesJson<T>(endpointPath: string): Promise<T> {
-  const bases = ['https://fapi.binance.com', 'https://fapi.binance.vision'];
-  let lastError: unknown = null;
-  for (const base of bases) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3200);
-    try {
-      const res = await fetch(`${base}${endpointPath}`, {
-        signal: controller.signal,
-        headers: { Accept: 'application/json' },
-      });
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status} from ${base}`);
-      }
-      return (await res.json()) as T;
-    } catch (err) {
-      lastError = err;
-    } finally {
-      clearTimeout(timeout);
-    }
+  if (Date.now() < fapiFuturesBlockedUntil) {
+    throw new Error('Binance Futures REST temporarily in cooldown');
   }
-  throw lastError ?? new Error('Unable to reach futures market data provider');
+  const base = 'https://fapi.binance.com';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1800);
+  try {
+    const res = await fetch(`${base}${endpointPath}`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) {
+      if (res.status === 451 || res.status === 403 || res.status === 429) {
+        fapiFuturesBlockedUntil = Date.now() + 5 * 60_000;
+      }
+      throw new Error(`HTTP ${res.status} from ${base}`);
+    }
+    return (await res.json()) as T;
+  } catch (err) {
+    if (fapiFuturesBlockedUntil < Date.now()) {
+      fapiFuturesBlockedUntil = Date.now() + 5 * 60_000;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function fetchBinanceJson<T>(endpointPath: string): Promise<T> {
@@ -294,6 +301,7 @@ function aggregateCandlesByMonths(candles: Candle[], months: number): Candle[] {
 let xauSpotPrice = 0;
 let xauSpotUpdatedAt = 0;
 let xauRefPrice = 0;
+const xauSourceBasis: Record<string, number> = {};
 let btcSpotPrice = 0;
 let btcSpotUpdatedAt = 0;
 let btcUsdtRefPrice = 0;
@@ -531,141 +539,492 @@ async function ensureSpotCalibration(): Promise<void> {
   await Promise.race([spotInitPromise, new Promise((r) => setTimeout(r, 1500))]);
 }
 
+const OKX_BAR_MAP: Record<string, { bar: string; bucketMs?: number; monthFactor?: number; barMs: number }> = {
+  '1m': { bar: '1m', barMs: 60_000 },
+  '2m': { bar: '1m', bucketMs: 120_000, barMs: 60_000 },
+  '3m': { bar: '3m', barMs: 180_000 },
+  '5m': { bar: '5m', barMs: 300_000 },
+  '10m': { bar: '5m', bucketMs: 600_000, barMs: 300_000 },
+  '15m': { bar: '15m', barMs: 900_000 },
+  '30m': { bar: '30m', barMs: 1_800_000 },
+  '45m': { bar: '15m', bucketMs: 2_700_000, barMs: 900_000 },
+  '1h': { bar: '1H', barMs: 3_600_000 },
+  '2h': { bar: '2H', barMs: 7_200_000 },
+  '3h': { bar: '1H', bucketMs: 10_800_000, barMs: 3_600_000 },
+  '4h': { bar: '4H', barMs: 14_400_000 },
+  '1D': { bar: '1Dutc', barMs: 86_400_000 },
+  '1W': { bar: '1Wutc', barMs: 604_800_000 },
+  '1M': { bar: '1Mutc', barMs: 2_592_000_000 },
+  '3M': { bar: '1Mutc', monthFactor: 3, barMs: 2_592_000_000 },
+  '6M': { bar: '1Mutc', monthFactor: 6, barMs: 2_592_000_000 },
+  '12M': { bar: '1Mutc', monthFactor: 12, barMs: 2_592_000_000 },
+};
+
+let okxBlockedUntil = 0;
+
+async function fetchOkxXauCandles(
+  interval: string,
+  limit = 350,
+  endTime?: number
+): Promise<Candle[] | null> {
+  if (Date.now() < okxBlockedUntil) return null;
+  const okxSpec = OKX_BAR_MAP[interval];
+  if (!okxSpec) return null;
+  const spec = INTERVAL_MAP[interval];
+  if (!spec) return null;
+
+  const clampedLimit = Math.max(20, Math.min(1000, limit));
+  const multiplier = okxSpec.bucketMs
+    ? Math.max(1, Math.round(okxSpec.bucketMs / okxSpec.barMs))
+    : okxSpec.monthFactor || 1;
+  const totalNeeded = Math.min(1500, clampedLimit * multiplier + multiplier);
+  const pageCap = endTime ? 100 : 300;
+  const pagesNeeded = Math.min(6, Math.ceil(totalNeeded / pageCap));
+
+  let allBase: Candle[] = [];
+  let cursorAfter = endTime ? Math.floor(endTime) : undefined;
+
+  for (let p = 0; p < pagesNeeded; p++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1800);
+    try {
+      const useHistoryEndpoint = Boolean(cursorAfter) && p > 0;
+      const endpoint = useHistoryEndpoint ? 'history-candles' : 'candles';
+      const reqLimit = Math.min(useHistoryEndpoint ? 100 : 300, totalNeeded - allBase.length);
+      if (reqLimit <= 0) break;
+      const qs = new URLSearchParams({
+        instId: 'XAU-USDT-SWAP',
+        bar: okxSpec.bar,
+        limit: String(reqLimit),
+      });
+      if (cursorAfter) {
+        qs.set('after', String(cursorAfter));
+      }
+      const res = await fetch(`https://www.okx.com/api/v5/market/${endpoint}?${qs.toString()}`, {
+        signal: controller.signal,
+        headers: { Accept: 'application/json', 'User-Agent': 'LeadersView/1.0' },
+      });
+      if (!res.ok) {
+        if (p === 0) okxBlockedUntil = Date.now() + 5 * 60_000;
+        return allBase.length > 0 ? allBase : null;
+      }
+      const body = (await res.json()) as { code?: string; data?: string[][] };
+      if (body.code !== '0' || !Array.isArray(body.data) || body.data.length === 0) break;
+      const parsed: Candle[] = [];
+      for (const row of body.data) {
+        const time = Number(row[0]);
+        const open = Number(row[1]);
+        const high = Number(row[2]);
+        const low = Number(row[3]);
+        const close = Number(row[4]);
+        const volume = Number(row[5]);
+        if (
+          Number.isFinite(time) &&
+          Number.isFinite(open) &&
+          Number.isFinite(high) &&
+          Number.isFinite(low) &&
+          Number.isFinite(close)
+        ) {
+          parsed.push({ time, open, high, low, close, volume: Number.isFinite(volume) ? volume : 0 });
+        }
+      }
+      if (parsed.length === 0) break;
+      parsed.sort((a, b) => a.time - b.time);
+      allBase = [...parsed, ...allBase];
+      cursorAfter = parsed[0].time;
+      if (parsed.length < reqLimit || allBase.length >= totalNeeded) break;
+    } catch {
+      if (p === 0) okxBlockedUntil = Date.now() + 5 * 60_000;
+      return allBase.length > 0 ? allBase : null;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  if (allBase.length === 0) return null;
+  const dedupedMap = new Map<number, Candle>();
+  for (const c of allBase) dedupedMap.set(c.time, c);
+  let result = Array.from(dedupedMap.values()).sort((a, b) => a.time - b.time);
+
+  if (okxSpec.bucketMs) {
+    result = aggregateCandlesByMs(result, okxSpec.bucketMs);
+  } else if (okxSpec.monthFactor) {
+    result = aggregateCandlesByMonths(result, okxSpec.monthFactor);
+  }
+  if (result.length > clampedLimit) {
+    result = result.slice(result.length - clampedLimit);
+  }
+  return result;
+}
+
+async function fetchBinanceSpotPaxgCandles(
+  interval: string,
+  limit = 350,
+  endTime?: number,
+  startTime?: number
+): Promise<Candle[]> {
+  const spec = INTERVAL_MAP[interval];
+  if (!spec) return [];
+  const clampedLimit = Math.max(20, Math.min(1000, limit));
+  const baseDur = INTERVAL_MAP[spec.native]?.durationMs || 1000;
+  const multiplier = spec.bucketMs
+    ? Math.max(1, Math.round(spec.bucketMs / baseDur))
+    : spec.monthFactor || 1;
+  const totalNeeded = Math.min(3000, clampedLimit * multiplier + multiplier);
+  const pagesNeeded = Math.min(3, Math.ceil(totalNeeded / 1000));
+
+  let allBase: Candle[] = [];
+  let cursorEnd = endTime;
+
+  for (let p = 0; p < pagesNeeded; p++) {
+    const reqLimit = Math.min(1000, totalNeeded - allBase.length);
+    if (reqLimit <= 0) break;
+    const params = new URLSearchParams({
+      symbol: 'PAXGUSDT',
+      interval: spec.native,
+      limit: String(reqLimit),
+    });
+    if (cursorEnd && Number.isFinite(cursorEnd)) {
+      params.set('endTime', String(Math.floor(cursorEnd)));
+    }
+    if (startTime && Number.isFinite(startTime) && pagesNeeded === 1) {
+      params.set('startTime', String(Math.floor(startTime)));
+    }
+    const raw = await fetchBinanceJson<unknown[][]>(`/api/v3/klines?${params.toString()}`);
+    const parsed = parseBinanceKlines(raw);
+    if (parsed.length === 0) break;
+    allBase = [...parsed, ...allBase];
+    cursorEnd = parsed[0].time - 1;
+    if (parsed.length < reqLimit) break;
+  }
+
+  const dedupedMap = new Map<number, Candle>();
+  for (const c of allBase) dedupedMap.set(c.time, c);
+  let result = Array.from(dedupedMap.values()).sort((a, b) => a.time - b.time);
+
+  if (spec.bucketMs) {
+    result = aggregateCandlesByMs(result, spec.bucketMs);
+  } else if (spec.monthFactor) {
+    result = aggregateCandlesByMonths(result, spec.monthFactor);
+  }
+  if (result.length > clampedLimit) {
+    result = result.slice(result.length - clampedLimit);
+  }
+  return result;
+}
+
+const KRAKEN_INTERVAL_MAP: Record<string, { krakenMin: number; bucketMs?: number; monthFactor?: number }> = {
+  '1m': { krakenMin: 1 },
+  '2m': { krakenMin: 1, bucketMs: 120_000 },
+  '3m': { krakenMin: 1, bucketMs: 180_000 },
+  '5m': { krakenMin: 5 },
+  '10m': { krakenMin: 5, bucketMs: 600_000 },
+  '15m': { krakenMin: 15 },
+  '30m': { krakenMin: 30 },
+  '45m': { krakenMin: 15, bucketMs: 2_700_000 },
+  '1h': { krakenMin: 60 },
+  '2h': { krakenMin: 60, bucketMs: 7_200_000 },
+  '3h': { krakenMin: 60, bucketMs: 10_800_000 },
+  '4h': { krakenMin: 240 },
+  '1D': { krakenMin: 1440 },
+  '1W': { krakenMin: 10080 },
+  '1M': { krakenMin: 1440, monthFactor: 1 },
+  '3M': { krakenMin: 1440, monthFactor: 3 },
+  '6M': { krakenMin: 1440, monthFactor: 6 },
+  '12M': { krakenMin: 1440, monthFactor: 12 },
+};
+
+async function fetchKrakenPaxgCandles(
+  interval: string,
+  limit = 350,
+  endTime?: number
+): Promise<Candle[] | null> {
+  const kSpec = KRAKEN_INTERVAL_MAP[interval];
+  if (!kSpec) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3200);
+  try {
+    const qs = new URLSearchParams({
+      pair: 'PAXGUSD',
+      interval: String(kSpec.krakenMin),
+    });
+    const res = await fetch(`https://api.kraken.com/0/public/OHLC?${qs.toString()}`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json', 'User-Agent': 'LeadersView/1.0' },
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { error?: string[]; result?: Record<string, unknown> };
+    const rows = body.result?.PAXGUSD;
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const parsed: Candle[] = [];
+    for (const row of rows as Array<Array<string | number>>) {
+      const time = Number(row[0]) * 1000;
+      const open = Number(row[1]);
+      const high = Number(row[2]);
+      const low = Number(row[3]);
+      const close = Number(row[4]);
+      const volume = Number(row[6]);
+      if (endTime && time > endTime) continue;
+      if (
+        Number.isFinite(time) &&
+        Number.isFinite(open) &&
+        Number.isFinite(high) &&
+        Number.isFinite(low) &&
+        Number.isFinite(close)
+      ) {
+        parsed.push({ time, open, high, low, close, volume: Number.isFinite(volume) ? volume : 0 });
+      }
+    }
+    parsed.sort((a, b) => a.time - b.time);
+    let result = parsed;
+    if (kSpec.bucketMs) {
+      result = aggregateCandlesByMs(result, kSpec.bucketMs);
+    } else if (kSpec.monthFactor) {
+      result = aggregateCandlesByMonths(result, kSpec.monthFactor);
+    }
+    const clampedLimit = Math.max(20, Math.min(1000, limit));
+    if (result.length > clampedLimit) {
+      result = result.slice(result.length - clampedLimit);
+    }
+    return result.length > 0 ? result : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+const TWELVEDATA_INTERVAL_MAP: Record<string, { tdInterval: string; bucketMs?: number; monthFactor?: number }> = {
+  '1m': { tdInterval: '1min' },
+  '2m': { tdInterval: '1min', bucketMs: 120_000 },
+  '3m': { tdInterval: '1min', bucketMs: 180_000 },
+  '5m': { tdInterval: '5min' },
+  '10m': { tdInterval: '5min', bucketMs: 600_000 },
+  '15m': { tdInterval: '15min' },
+  '30m': { tdInterval: '30min' },
+  '45m': { tdInterval: '45min' },
+  '1h': { tdInterval: '1h' },
+  '2h': { tdInterval: '2h' },
+  '3h': { tdInterval: '1h', bucketMs: 10_800_000 },
+  '4h': { tdInterval: '4h' },
+  '1D': { tdInterval: '1day' },
+  '1W': { tdInterval: '1week' },
+  '1M': { tdInterval: '1month' },
+  '3M': { tdInterval: '1month', monthFactor: 3 },
+  '6M': { tdInterval: '1month', monthFactor: 6 },
+  '12M': { tdInterval: '1month', monthFactor: 12 },
+};
+
+async function fetchTwelveDataXauCandles(
+  interval: string,
+  limit = 350,
+  endTime?: number
+): Promise<Candle[] | null> {
+  const apiKey = (process.env.TWELVEDATA_API_KEY || '').trim();
+  if (!apiKey) return null;
+  const tdSpec = TWELVEDATA_INTERVAL_MAP[interval];
+  if (!tdSpec) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3200);
+  try {
+    const qs = new URLSearchParams({
+      symbol: 'XAU/USD',
+      interval: tdSpec.tdInterval,
+      outputsize: String(Math.min(500, Math.max(40, limit))),
+      timezone: 'UTC',
+      apikey: apiKey,
+    });
+    if (endTime && Number.isFinite(endTime)) {
+      qs.set('end_date', new Date(endTime).toISOString().replace('T', ' ').slice(0, 19));
+    }
+    const res = await fetch(`https://api.twelvedata.com/time_series?${qs.toString()}`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as {
+      status?: string;
+      values?: Array<{ datetime: string; open: string; high: string; low: string; close: string; volume?: string }>;
+    };
+    if (body.status === 'error' || !Array.isArray(body.values) || body.values.length === 0) return null;
+
+    const parsed: Candle[] = [];
+    for (const v of body.values) {
+      const iso = v.datetime.includes('T') ? v.datetime : `${v.datetime.replace(' ', 'T')}Z`;
+      const time = Date.parse(iso.endsWith('Z') ? iso : `${iso}Z`);
+      const open = Number(v.open);
+      const high = Number(v.high);
+      const low = Number(v.low);
+      const close = Number(v.close);
+      const volume = Number(v.volume || 0);
+      if (
+        Number.isFinite(time) &&
+        Number.isFinite(open) &&
+        Number.isFinite(high) &&
+        Number.isFinite(low) &&
+        Number.isFinite(close)
+      ) {
+        parsed.push({ time, open, high, low, close, volume: Number.isFinite(volume) ? volume : 0 });
+      }
+    }
+    parsed.sort((a, b) => a.time - b.time);
+    let result = parsed;
+    if (tdSpec.bucketMs) {
+      result = aggregateCandlesByMs(result, tdSpec.bucketMs);
+    } else if (tdSpec.monthFactor) {
+      result = aggregateCandlesByMonths(result, tdSpec.monthFactor);
+    }
+    return result.length > 0 ? result : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function fetchXauSubMinuteCandles(
   interval: string,
   limit = 350,
   endTime?: number
-): Promise<Candle[]> {
+): Promise<{ candles: Candle[]; source: string }> {
   const spec = INTERVAL_MAP[interval];
-  if (!spec) return [];
+  if (!spec) return { candles: [], source: 'xauusdt' };
   const bucketMs = spec.bucketMs || spec.durationMs;
   const clampedLimit = Math.max(20, Math.min(1000, limit));
 
-  // Build dense continuous sub-minute bars from live XAUUSDT Futures aggTrades for recent window
-  const maxPages = interval === '1s' ? 3 : 2;
-  let allTrades: Array<{ a: number; p: string; q: string; T: number }> = [];
-  let fromId: number | undefined;
-  const qsBase = endTime && Number.isFinite(endTime)
-    ? `&endTime=${Math.floor(endTime)}`
-    : '';
+  try {
+    // Build dense continuous sub-minute bars from live XAUUSDT Futures aggTrades for recent window
+    const maxPages = interval === '1s' ? 3 : 2;
+    let allTrades: Array<{ a: number; p: string; q: string; T: number }> = [];
+    let fromId: number | undefined;
+    const qsBase = endTime && Number.isFinite(endTime)
+      ? `&endTime=${Math.floor(endTime)}`
+      : '';
 
-  if (!endTime) {
-    for (let p = 0; p < maxPages; p++) {
-      const qs = fromId
-        ? `symbol=XAUUSDT&limit=1000&fromId=${fromId}`
-        : `symbol=XAUUSDT&limit=1000${qsBase}`;
-      const batch = await fetchBinanceFuturesJson<Array<{ a: number; p: string; q: string; T: number }>>(
-        `/fapi/v1/aggTrades?${qs}`
-      );
-      if (!Array.isArray(batch) || batch.length === 0) break;
-      allTrades = [...batch, ...allTrades];
-      const firstId = batch[0].a;
-      if (firstId <= 1 || batch.length < 1000) break;
-      fromId = Math.max(1, firstId - 1000);
+    if (!endTime) {
+      for (let p = 0; p < maxPages; p++) {
+        const qs = fromId
+          ? `symbol=XAUUSDT&limit=1000&fromId=${fromId}`
+          : `symbol=XAUUSDT&limit=1000${qsBase}`;
+        const batch = await fetchBinanceFuturesJson<Array<{ a: number; p: string; q: string; T: number }>>(
+          `/fapi/v1/aggTrades?${qs}`
+        );
+        if (!Array.isArray(batch) || batch.length === 0) break;
+        allTrades = [...batch, ...allTrades];
+        const firstId = batch[0].a;
+        if (firstId <= 1 || batch.length < 1000) break;
+        fromId = Math.max(1, firstId - 1000);
+      }
     }
-  }
 
-  const buckets = new Map<number, Candle>();
-  for (const t of allTrades) {
-    const price = Number(t.p);
-    const qty = Number(t.q);
-    const ts = Number(t.T);
-    if (!Number.isFinite(price) || !Number.isFinite(ts) || price <= 0) continue;
-    const bTime = Math.floor(ts / bucketMs) * bucketMs;
-    const ex = buckets.get(bTime);
-    if (!ex) {
-      buckets.set(bTime, {
-        time: bTime,
-        open: price,
-        high: price,
-        low: price,
-        close: price,
-        volume: Number.isFinite(qty) ? qty : 0,
-      });
-    } else {
-      if (price > ex.high) ex.high = price;
-      if (price < ex.low) ex.low = price;
-      ex.close = price;
-      ex.volume += Number.isFinite(qty) ? qty : 0;
-    }
-  }
-
-  let dense: Candle[] = [];
-  const sortedTimes = Array.from(buckets.keys()).sort((a, b) => a - b);
-  if (sortedTimes.length > 0) {
-    const startB = sortedTimes[0];
-    const endB = sortedTimes[sortedTimes.length - 1];
-    let prevClose = buckets.get(startB)!.open;
-    for (let t = startB; t <= endB; t += bucketMs) {
-      const existing = buckets.get(t);
-      if (existing) {
-        // Keep open continuous with previous bar close for smooth candlestick visual flow
-        const cOpen = prevClose;
-        dense.push({
-          time: t,
-          open: cOpen,
-          high: Math.max(cOpen, existing.high),
-          low: Math.min(cOpen, existing.low),
-          close: existing.close,
-          volume: existing.volume,
+    const buckets = new Map<number, Candle>();
+    for (const t of allTrades) {
+      const price = Number(t.p);
+      const qty = Number(t.q);
+      const ts = Number(t.T);
+      if (!Number.isFinite(price) || !Number.isFinite(ts) || price <= 0) continue;
+      const bTime = Math.floor(ts / bucketMs) * bucketMs;
+      const ex = buckets.get(bTime);
+      if (!ex) {
+        buckets.set(bTime, {
+          time: bTime,
+          open: price,
+          high: price,
+          low: price,
+          close: price,
+          volume: Number.isFinite(qty) ? qty : 0,
         });
-        prevClose = existing.close;
       } else {
-        dense.push({
-          time: t,
-          open: prevClose,
-          high: prevClose,
-          low: prevClose,
-          close: prevClose,
-          volume: 0,
-        });
+        if (price > ex.high) ex.high = price;
+        if (price < ex.low) ex.low = price;
+        ex.close = price;
+        ex.volume += Number.isFinite(qty) ? qty : 0;
       }
     }
-  }
 
-  // If caller wants older history or more bars than aggTrades span, backfill seamlessly from 1m XAUUSDT bars
-  if (dense.length < clampedLimit) {
-    const neededBars = clampedLimit - dense.length;
-    const neededMinutes = Math.min(1000, Math.ceil((neededBars * bucketMs) / 60_000) + 5);
-    const beforeMs = dense.length > 0 ? dense[0].time - 1 : endTime;
-    const qs = new URLSearchParams({
-      symbol: 'XAUUSDT',
-      interval: '1m',
-      limit: String(Math.max(20, neededMinutes)),
-    });
-    if (beforeMs && Number.isFinite(beforeMs)) {
-      qs.set('endTime', String(Math.floor(beforeMs)));
-    }
-    const raw1m = await fetchBinanceFuturesJson<unknown[][]>(`/fapi/v1/klines?${qs.toString()}`).catch(() => []);
-    const parsed1m = parseBinanceKlines(raw1m);
-    const subPerMin = Math.max(1, Math.round(60_000 / bucketMs));
-    const expanded: Candle[] = [];
-    for (const m of parsed1m) {
-      const stepDelta = (m.close - m.open) / subPerMin;
-      for (let s = 0; s < subPerMin; s++) {
-        const t = m.time + s * bucketMs;
-        if (dense.length > 0 && t >= dense[0].time) break;
-        const o = s === 0 ? m.open : m.open + stepDelta * s;
-        const c = s === subPerMin - 1 ? m.close : m.open + stepDelta * (s + 1);
-        const h = s === 0 ? Math.max(o, c, m.high) : Math.max(o, c);
-        const l = s === subPerMin - 1 ? Math.min(o, c, m.low) : Math.min(o, c);
-        expanded.push({
-          time: t,
-          open: roundPrice(o),
-          high: roundPrice(h),
-          low: roundPrice(l),
-          close: roundPrice(c),
-          volume: m.volume / subPerMin,
-        });
+    let dense: Candle[] = [];
+    const sortedTimes = Array.from(buckets.keys()).sort((a, b) => a - b);
+    if (sortedTimes.length > 0) {
+      const startB = sortedTimes[0];
+      const endB = sortedTimes[sortedTimes.length - 1];
+      let prevClose = buckets.get(startB)!.open;
+      for (let t = startB; t <= endB; t += bucketMs) {
+        const existing = buckets.get(t);
+        if (existing) {
+          const cOpen = prevClose;
+          dense.push({
+            time: t,
+            open: cOpen,
+            high: Math.max(cOpen, existing.high),
+            low: Math.min(cOpen, existing.low),
+            close: existing.close,
+            volume: existing.volume,
+          });
+          prevClose = existing.close;
+        } else {
+          dense.push({
+            time: t,
+            open: prevClose,
+            high: prevClose,
+            low: prevClose,
+            close: prevClose,
+            volume: 0,
+          });
+        }
       }
     }
-    dense = [...expanded, ...dense];
+
+    if (dense.length < clampedLimit) {
+      const neededBars = clampedLimit - dense.length;
+      const neededMinutes = Math.min(1000, Math.ceil((neededBars * bucketMs) / 60_000) + 5);
+      const beforeMs = dense.length > 0 ? dense[0].time - 1 : endTime;
+      const qs = new URLSearchParams({
+        symbol: 'XAUUSDT',
+        interval: '1m',
+        limit: String(Math.max(20, neededMinutes)),
+      });
+      if (beforeMs && Number.isFinite(beforeMs)) {
+        qs.set('endTime', String(Math.floor(beforeMs)));
+      }
+      const raw1m = await fetchBinanceFuturesJson<unknown[][]>(`/fapi/v1/klines?${qs.toString()}`);
+      const parsed1m = parseBinanceKlines(raw1m);
+      const subPerMin = Math.max(1, Math.round(60_000 / bucketMs));
+      const expanded: Candle[] = [];
+      for (const m of parsed1m) {
+        const stepDelta = (m.close - m.open) / subPerMin;
+        for (let s = 0; s < subPerMin; s++) {
+          const t = m.time + s * bucketMs;
+          if (dense.length > 0 && t >= dense[0].time) break;
+          const o = s === 0 ? m.open : m.open + stepDelta * s;
+          const c = s === subPerMin - 1 ? m.close : m.open + stepDelta * (s + 1);
+          const h = s === 0 ? Math.max(o, c, m.high) : Math.max(o, c);
+          const l = s === subPerMin - 1 ? Math.min(o, c, m.low) : Math.min(o, c);
+          expanded.push({
+            time: t,
+            open: roundPrice(o),
+            high: roundPrice(h),
+            low: roundPrice(l),
+            close: roundPrice(c),
+            volume: m.volume / subPerMin,
+          });
+        }
+      }
+      dense = [...expanded, ...dense];
+    }
+
+    if (dense.length > clampedLimit) {
+      dense = dense.slice(dense.length - clampedLimit);
+    }
+    if (dense.length > 0) {
+      return { candles: dense, source: 'xauusdt' };
+    }
+  } catch {
+    // Fall through cleanly to cloud-safe Binance Public Data CDN PAXGUSDT 1s klines
   }
 
-  if (dense.length > clampedLimit) {
-    dense = dense.slice(dense.length - clampedLimit);
-  }
-  return dense;
+  const paxgSub = await fetchBinanceSpotPaxgCandles(interval, clampedLimit, endTime);
+  return { candles: paxgSub, source: 'paxgusdt' };
 }
 
 async function fetchHistoricalCandles(
@@ -702,9 +1061,100 @@ async function fetchHistoricalCandles(
 
   const clampedLimit = Math.max(20, Math.min(1000, limit));
   let result: Candle[] = [];
+  let xauSource = 'xauusdt';
 
   if (market === 'XAUUSD' && spec.native === '1s') {
-    result = await fetchXauSubMinuteCandles(interval, clampedLimit, endTime);
+    const sub = await fetchXauSubMinuteCandles(interval, clampedLimit, endTime);
+    result = sub.candles;
+    xauSource = sub.source;
+  } else if (market === 'XAUUSD') {
+    // 0. Optional TwelveData native XAU/USD forex spot candles when TWELVEDATA_API_KEY is configured
+    const tdCandles = await fetchTwelveDataXauCandles(interval, clampedLimit, endTime);
+    if (tdCandles && tdCandles.length > 0) {
+      result = tdCandles;
+      xauSource = 'twelvedata';
+    }
+
+    // 1. Primary Binance Futures XAUUSDT when accessible
+    if (result.length === 0) {
+      try {
+        const multiplier = spec.bucketMs
+          ? Math.max(1, Math.round(spec.bucketMs / (INTERVAL_MAP[spec.native]?.durationMs || 1000)))
+          : spec.monthFactor || 1;
+        const totalNeeded = Math.min(3000, clampedLimit * multiplier + multiplier);
+        const pagesNeeded = Math.min(3, Math.ceil(totalNeeded / 1000));
+        let allBase: Candle[] = [];
+        let cursorEnd = endTime;
+
+        for (let p = 0; p < pagesNeeded; p++) {
+          const reqLimit = Math.min(1000, totalNeeded - allBase.length);
+          if (reqLimit <= 0) break;
+          const params = new URLSearchParams({
+            symbol: cfg.providerSymbol,
+            interval: spec.native,
+            limit: String(reqLimit),
+          });
+          if (cursorEnd && Number.isFinite(cursorEnd)) {
+            params.set('endTime', String(Math.floor(cursorEnd)));
+          }
+          if (startTime && Number.isFinite(startTime) && pagesNeeded === 1) {
+            params.set('startTime', String(Math.floor(startTime)));
+          }
+          const raw = await fetchBinanceFuturesJson<unknown[][]>(`/fapi/v1/klines?${params.toString()}`);
+          const parsed = parseBinanceKlines(raw);
+          if (parsed.length === 0) break;
+          allBase = [...parsed, ...allBase];
+          cursorEnd = parsed[0].time - 1;
+          if (parsed.length < reqLimit) break;
+        }
+
+        const dedupedMap = new Map<number, Candle>();
+        for (const c of allBase) dedupedMap.set(c.time, c);
+        result = Array.from(dedupedMap.values()).sort((a, b) => a.time - b.time);
+        if (spec.bucketMs) {
+          result = aggregateCandlesByMs(result, spec.bucketMs);
+        } else if (spec.monthFactor) {
+          result = aggregateCandlesByMonths(result, spec.monthFactor);
+        }
+        if (result.length > clampedLimit) {
+          result = result.slice(result.length - clampedLimit);
+        }
+        xauSource = 'xauusdt';
+      } catch {
+        // Futures REST unavailable on restricted cloud IPs -> fall through to unrestricted mirrors
+      }
+    }
+
+    // 2. Fallback to OKX XAU-USDT-SWAP perpetual candles
+    if (result.length === 0) {
+      const okxCandles = await fetchOkxXauCandles(interval, clampedLimit, endTime);
+      if (okxCandles && okxCandles.length > 0) {
+        result = okxCandles;
+        xauSource = 'okx_xau';
+      }
+    }
+
+    // 3. Fallback to unrestricted Binance Public Data CDN (PAXGUSDT physical 1:1 gold benchmark)
+    if (result.length === 0) {
+      try {
+        const paxgCandles = await fetchBinanceSpotPaxgCandles(interval, clampedLimit, endTime, startTime);
+        if (paxgCandles.length > 0) {
+          result = paxgCandles;
+          xauSource = 'paxgusdt';
+        }
+      } catch {
+        // Fall through to Kraken
+      }
+    }
+
+    // 4. Final fallback to US-regulated Kraken Spot PAXG/USD
+    if (result.length === 0) {
+      const krakenCandles = await fetchKrakenPaxgCandles(interval, clampedLimit, endTime);
+      if (krakenCandles && krakenCandles.length > 0) {
+        result = krakenCandles;
+        xauSource = 'kraken_paxg';
+      }
+    }
   } else {
     const multiplier = spec.bucketMs
       ? Math.max(1, Math.round(spec.bucketMs / (INTERVAL_MAP[spec.native]?.durationMs || 1000)))
@@ -730,10 +1180,7 @@ async function fetchHistoricalCandles(
       if (startTime && Number.isFinite(startTime) && pagesNeeded === 1) {
         params.set('startTime', String(Math.floor(startTime)));
       }
-      const raw =
-        market === 'XAUUSD'
-          ? await fetchBinanceFuturesJson<unknown[][]>(`/fapi/v1/klines?${params.toString()}`)
-          : await fetchBinanceJson<unknown[][]>(`/api/v3/klines?${params.toString()}`);
+      const raw = await fetchBinanceJson<unknown[][]>(`/api/v3/klines?${params.toString()}`);
       const parsed = parseBinanceKlines(raw);
       if (parsed.length === 0) break;
       allBase = [...parsed, ...allBase];
@@ -763,10 +1210,25 @@ async function fetchHistoricalCandles(
   // Apply live Spot USD calibration so XAUUSD matches real Spot Gold and BTCUSD matches real BTC/USD
   if (result.length > 0) {
     if (market === 'XAUUSD') {
-      if (!endTime && !startTime) {
-        xauRefPrice = result[result.length - 1].close;
+      const rawLast = result[result.length - 1].close;
+      const targetSpot = liveTickers.XAUUSD?.price || xauSpotPrice;
+      let basis = xauSourceBasis[xauSource] ?? 0;
+
+      if (xauSource === 'twelvedata') {
+        basis = 0;
+      } else if (!endTime && !startTime && targetSpot > 0 && rawLast > 0) {
+        const diff = targetSpot - rawLast;
+        if (Math.abs(diff) < targetSpot * 0.05) {
+          basis = roundPrice(diff);
+          xauSourceBasis[xauSource] = basis;
+        }
+        if (xauSource === 'xauusdt') {
+          xauRefPrice = rawLast;
+        }
+      } else if (xauSource === 'xauusdt' && basis === 0) {
+        basis = getXauBasis();
       }
-      const basis = getXauBasis();
+
       if (basis !== 0) {
         result = result.map((c) => ({
           ...c,
@@ -776,11 +1238,11 @@ async function fetchHistoricalCandles(
           close: roundPrice(c.close + basis),
         }));
       }
-      if (!endTime && !startTime && xauSpotPrice > 0) {
+      if (!endTime && !startTime && targetSpot > 0) {
         const last = result[result.length - 1];
-        last.close = xauSpotPrice;
-        last.high = Math.max(last.high, xauSpotPrice);
-        last.low = Math.min(last.low, xauSpotPrice);
+        last.close = targetSpot;
+        last.high = Math.max(last.high, targetSpot);
+        last.low = Math.min(last.low, targetSpot);
       }
     } else if (market === 'BTCUSD') {
       if (!endTime && !startTime) {
@@ -859,7 +1321,7 @@ async function refreshTickersFromRest(): Promise<void> {
           volume: string;
           closeTime: number;
         }>
-      >(`/api/v3/ticker/24hr?symbols=${encodeURIComponent('["BTCUSDT"]')}`).catch(() => []),
+      >(`/api/v3/ticker/24hr?symbols=${encodeURIComponent('["BTCUSDT","PAXGUSDT"]')}`).catch(() => []),
       fetchBinanceFuturesJson<{
         symbol: string;
         lastPrice: string;
@@ -882,8 +1344,11 @@ async function refreshTickersFromRest(): Promise<void> {
       btcSpotUpdatedAt = Date.now();
     }
 
+    let paxg24h: (typeof binanceRaw)[number] | undefined;
     for (const item of binanceRaw) {
-      if (item.symbol === 'BTCUSDT') {
+      if (item.symbol === 'PAXGUSDT') {
+        paxg24h = item;
+      } else if (item.symbol === 'BTCUSDT') {
         btcUsdtRefPrice = Number(item.lastPrice) || btcUsdtRefPrice;
         const price = cbBtc ? cbBtc.last : roundPrice(Number(item.lastPrice) * getBtcUsdRatio());
         const open24h = cbBtc ? cbBtc.open : roundPrice(Number(item.openPrice) * getBtcUsdRatio());
@@ -908,13 +1373,20 @@ async function refreshTickersFromRest(): Promise<void> {
       }
     }
 
-    if (xau24h && Number(xau24h.lastPrice) > 0) {
-      xauRefPrice = Number(xau24h.lastPrice);
+    const xauSourceTicker =
+      xau24h && Number(xau24h.lastPrice) > 0
+        ? xau24h
+        : paxg24h && Number(paxg24h.lastPrice) > 0
+          ? paxg24h
+          : null;
+
+    if (xauSourceTicker) {
+      xauRefPrice = Number(xauSourceTicker.lastPrice);
       const basis = getXauBasis();
       const price = sqGold ?? roundPrice(xauRefPrice + basis);
-      const open24h = roundPrice(Number(xau24h.openPrice) + basis);
-      const high24h = Math.max(price, roundPrice(Number(xau24h.highPrice) + basis));
-      const low24h = Math.min(price, roundPrice(Number(xau24h.lowPrice) + basis));
+      const open24h = roundPrice(Number(xauSourceTicker.openPrice) + basis);
+      const high24h = Math.max(price, roundPrice(Number(xauSourceTicker.highPrice) + basis));
+      const low24h = Math.min(price, roundPrice(Number(xauSourceTicker.lowPrice) + basis));
       const change = roundPrice(price - open24h);
       const changePercent = open24h > 0 ? (change / open24h) * 100 : 0;
       liveTickers.XAUUSD = {
@@ -928,7 +1400,7 @@ async function refreshTickersFromRest(): Promise<void> {
         changePercent,
         high24h,
         low24h,
-        volume24h: Number(xau24h.volume) || 0,
+        volume24h: Number(xauSourceTicker.volume) || 0,
         timestamp: Date.now(),
       };
     }
