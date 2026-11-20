@@ -1,0 +1,180 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --lv-bg: #F6F4EE;
+    --lv-surface: #FFFFFF;
+    --lv-surface-elevated: #FBF9F4;
+    --lv-surface-hover: #F0ECE1;
+    --lv-border: rgba(20, 19, 17, 0.18);
+    --lv-border-strong: rgba(20, 19, 17, 0.45);
+    --lv-text: #141311;
+    --lv-text-muted: #625D52;
+    --lv-gold: #141311;
+    --lv-gold-bright: #141311;
+    --lv-gold-soft: rgba(20, 19, 17, 0.1);
+    --lv-up: #0F9D68;
+    --lv-down: #D63946;
+  }
+
+  .dark {
+    --lv-bg: #080808;
+    --lv-surface: #101012;
+    --lv-surface-elevated: #16161A;
+    --lv-surface-hover: #1E1D21;
+    --lv-border: rgba(255, 255, 255, 0.2);
+    --lv-border-strong: rgba(255, 255, 255, 0.5);
+    --lv-text: #F5F5F7;
+    --lv-text-muted: #9A9892;
+    --lv-gold: #FFFFFF;
+    --lv-gold-bright: #FFFFFF;
+    --lv-gold-soft: rgba(255, 255, 255, 0.14);
+    --lv-up: #19B87D;
+    --lv-down: #E54855;
+  }
+
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100dvh;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    background-color: var(--lv-bg);
+    color: var(--lv-text);
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+  }
+}
+
+.font-brand {
+  font-family: 'Cinzel', Georgia, serif;
+}
+
+.font-mono-num {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Custom clean white scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.25);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.5);
+}
+
+/* Subtle gold shimmer for opening screen */
+@keyframes lv-shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+.animate-lv-shimmer {
+  animation: lv-shimmer 1.8s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+.lv-chart-stage {
+  contain: layout style size;
+}
+
+.lv-gpu-layer {
+  transform: translateZ(0);
+  backface-visibility: hidden;
+  will-change: transform;
+}
+
+/* Ultra-slim hairline yellow opacity slider */
+.lv-thin-range {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  accent-color: #FACC15;
+  color: #FACC15;
+  height: 18px;
+  padding: 0;
+  margin: 0;
+  touch-action: none;
+}
+
+.lv-thin-range:focus {
+  outline: none;
+}
+
+.lv-thin-range::-webkit-slider-runnable-track {
+  height: 1px;
+  border-radius: 9999px;
+  background: #FACC15;
+}
+
+.lv-thin-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 2px;
+  height: 9px;
+  border-radius: 1px;
+  background: #FACC15;
+  border: none;
+  margin-top: -4px;
+  cursor: pointer;
+  transition: height 0.12s ease, opacity 0.12s ease;
+}
+
+.lv-thin-range:hover::-webkit-slider-thumb,
+.lv-thin-range:active::-webkit-slider-thumb {
+  height: 11px;
+  margin-top: -5px;
+}
+
+.lv-thin-range::-moz-range-track {
+  height: 1px;
+  border-radius: 9999px;
+  background: #FACC15;
+}
+
+.lv-thin-range::-moz-range-thumb {
+  width: 2px;
+  height: 9px;
+  border-radius: 1px;
+  background: #FACC15;
+  border: none;
+  cursor: pointer;
+  transition: height 0.12s ease;
+}
+
+.lv-thin-range:hover::-moz-range-thumb,
+.lv-thin-range:active::-moz-range-thumb {
+  height: 11px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-lv-shimmer {
+    animation: none;
+  }
+}

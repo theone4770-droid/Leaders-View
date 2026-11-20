@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>LEADERS VIEW — Professional Financial Charting</title>
+    <meta name="description" content="LEADERS VIEW professional luxury black and gold financial charting application with real-time WebSocket market data for XAUUSD and BTCUSD." />
+    <meta property="og:title" content="LEADERS VIEW — Professional Financial Charting" />
+    <meta property="og:description" content="LEADERS VIEW professional luxury black and gold financial charting application with real-time WebSocket market data for XAUUSD and BTCUSD." />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="/assets/aistudio/file_000000001a488208b6099279793e33f1_d26a340a.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#080808" />
+    <link rel="icon" type="image/png" href="/assets/aistudio/file_000000001a488208b6099279793e33f1_d26a340a.png" />
+    <link rel="apple-touch-icon" href="/assets/aistudio/file_000000001a488208b6099279793e33f1_d26a340a.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
+    <noscript>
+      <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    </noscript>
+    <script>
+      (function () {
+        try {
+          var t = JSON.parse(localStorage.getItem('lv_theme_v1') || '"dark"');
+          if (t === 'light') {
+            document.documentElement.classList.remove('dark');
+          } else {
+            document.documentElement.classList.add('dark');
+          }
+          var m = JSON.parse(localStorage.getItem('lv_selected_market_v1') || '"XAUUSD"');
+          m = m === 'BTCUSD' ? 'BTCUSD' : 'XAUUSD';
+          var tf = JSON.parse(localStorage.getItem('lv_timeframe_v1_' + m) || '"15m"') || '15m';
+          var url = '/api/klines?market=' + encodeURIComponent(m) + '&interval=' + encodeURIComponent(tf) + '&limit=400';
+          var entry = { url: url, resolved: null, promise: null };
+          entry.promise = fetch(url)
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (data) { entry.resolved = data; return data; })
+            .catch(function () { return null; });
+          window.__LV_INITIAL_KLINES__ = entry;
+
+          var tickersEntry = { resolved: null, promise: null };
+          tickersEntry.promise = fetch('/api/tickers')
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (data) { tickersEntry.resolved = data; return data; })
+            .catch(function () { return null; });
+          window.__LV_INITIAL_TICKERS__ = tickersEntry;
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body class="bg-[#080808] text-[#F5F5F7] antialiased selection:bg-[#D4AF37]/30 selection:text-[#F0D278] overflow-hidden">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

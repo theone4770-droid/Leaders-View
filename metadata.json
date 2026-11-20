@@ -1,0 +1,6 @@
+{
+  "name": "LEADERS VIEW",
+  "description": "Professional luxury black and gold financial charting application with real-time WebSocket market data for XAUUSD and BTCUSD, comprehensive drawing tools, bar replay, and price alerts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
