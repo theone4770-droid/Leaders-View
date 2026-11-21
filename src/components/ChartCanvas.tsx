@@ -1184,7 +1184,13 @@ export const ChartCanvas = React.memo(
           scheduleFrameRef.current();
         }
       }, 250);
-      return () => clearInterval(timer);
+      return () => {
+        clearInterval(timer);
+        if (longPressTimerRef.current !== null) {
+          clearTimeout(longPressTimerRef.current);
+          longPressTimerRef.current = null;
+        }
+      };
     }, [candlesRef]);
 
     const updateCrosshair = useCallback(
@@ -1616,7 +1622,12 @@ export const ChartCanvas = React.memo(
               const touchY = priceToY(touch.point.price, priceRange, plot);
               const defW = Math.max(72, Math.min(132, plot.width * 0.13));
               const defH = Math.max(36, Math.min(60, plot.height * 0.095));
-              let topPrice = yToPrice(touchY - defH, priceRange, plot);
+              const tlMaxPrice = Math.max(tlStart.price, tlEnd.price);
+              const tlMinPrice = Math.min(tlStart.price, tlEnd.price);
+              const isUpperEndpoint =
+                Math.abs(tlMaxPrice - tlMinPrice) > 1e-8 &&
+                Math.abs(touch.point.price - tlMaxPrice) <= 1e-6;
+              let secondPrice = yToPrice(touchY + (isUpperEndpoint ? defH : -defH), priceRange, plot);
               if (touch.isEnd) {
                 const matchedFib = drawingsRef.current.find(
                   (d) =>
@@ -1635,14 +1646,14 @@ export const ChartCanvas = React.memo(
                     ? tlStart.price + priceDiff * 0.11
                     : tlEnd.price - priceDiff * 0.11;
                   if (Math.abs(price0110 - tlEnd.price) > 1e-8) {
-                    topPrice = price0110;
+                    secondPrice = price0110;
                   }
                 }
               }
               firstPt = { time: touch.point.time, price: touch.point.price };
               secondPt = {
                 time: xToTime(touchX + defW, vis, intervalRef.current, viewportRef.current, plot),
-                price: topPrice,
+                price: secondPrice,
               };
             } else {
               rectAttachedTlRef.current = null;
@@ -2306,14 +2317,11 @@ export const ChartCanvas = React.memo(
               viewportRef.current,
               plot
             );
-            const origY = priceToY(
-              Math.min(origP0.price, origP1.price),
-              range,
-              plot
-            );
-            const origTouch = findTrendLineTouchPoint(
+            const origBottomY = priceToY(Math.min(origP0.price, origP1.price), range, plot);
+            const origTopY = priceToY(Math.max(origP0.price, origP1.price), range, plot);
+            const bottomTouch = findTrendLineTouchPoint(
               origX,
-              origY,
+              origBottomY,
               attachedTl,
               vis,
               intervalRef.current,
@@ -2321,6 +2329,22 @@ export const ChartCanvas = React.memo(
               range,
               plot
             );
+            const topTouch = findTrendLineTouchPoint(
+              origX,
+              origTopY,
+              attachedTl,
+              vis,
+              intervalRef.current,
+              viewportRef.current,
+              range,
+              plot
+            );
+            const topTouchScreenY = priceToY(topTouch.point.price, range, plot);
+            const bottomTouchScreenY = priceToY(bottomTouch.point.price, range, plot);
+            const origTouch =
+              Math.abs(origTopY - topTouchScreenY) < Math.abs(origBottomY - bottomTouchScreenY)
+                ? topTouch
+                : bottomTouch;
             resized = constrainRectangleToTrendLine(
               resized,
               attachedTl,

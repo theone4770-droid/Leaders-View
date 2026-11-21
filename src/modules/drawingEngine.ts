@@ -2425,16 +2425,29 @@ export function snapMovedRectangleToTrendLines(
   const tlEnd = bestTl.points[1];
   const isEndTouch = bestT >= 0.84;
   const anchorPoint = isEndTouch ? { ...tlEnd } : bestT <= 0.16 ? { ...tlStart } : bestTouchPoint;
+  const tlMaxPrice = Math.max(tlStart.price, tlEnd.price);
+  const tlMinPrice = Math.min(tlStart.price, tlEnd.price);
+  const isUpperEndpoint =
+    Math.abs(tlMaxPrice - tlMinPrice) > 1e-8 &&
+    (bestT <= 0.16 || bestT >= 0.84) &&
+    Math.abs(anchorPoint.price - tlMaxPrice) <= 1e-6;
   const boxHeight = Math.max(Math.abs(p1.price - p0.price), 1e-6);
   const origWidth = Math.max(Math.abs(p1.time - p0.time), getIntervalDurationMs(interval) * 3);
 
-  // Place the box on the right side of the touched Trend Line point (up, middle, or end)
+  // Place the box on the right side of the touched Trend Line point:
+  // - At the upper dot: catch the dot with the top edge so the box never goes above the trend line
+  // - At the lower dot / segment: catch the dot with the bottom edge
   const snapped: DrawingObject = {
     ...rect,
-    points: [
-      { time: anchorPoint.time, price: anchorPoint.price + boxHeight },
-      { time: anchorPoint.time + origWidth, price: anchorPoint.price },
-    ],
+    points: isUpperEndpoint
+      ? [
+          { time: anchorPoint.time, price: anchorPoint.price },
+          { time: anchorPoint.time + origWidth, price: anchorPoint.price - boxHeight },
+        ]
+      : [
+          { time: anchorPoint.time, price: anchorPoint.price + boxHeight },
+          { time: anchorPoint.time + origWidth, price: anchorPoint.price },
+        ],
   };
 
   // If touched at Trend Line End and a Fib Retracement is already snapped to this Trend Line, lock 0.110..end
@@ -2799,21 +2812,46 @@ export function constrainRectangleToTrendLine(
         ).point;
       })();
 
-  // Never go below the anchored Trend Line touch/end price
-  p0.price = Math.max(p0.price, anchor.price);
-  p1.price = Math.max(p1.price, anchor.price);
+  const tlStart = tl.points[0];
+  const tlEnd = tl.points[1];
+  const tlMaxPrice = Math.max(tlStart.price, tlEnd.price);
+  const tlMinPrice = Math.min(tlStart.price, tlEnd.price);
+  const isUpperAnchor =
+    Math.abs(tlMaxPrice - tlMinPrice) > 1e-8 && Math.abs(anchor.price - tlMaxPrice) <= 1e-6;
 
-  // Ensure box keeps non-zero height above anchor.price
   const minHeightPx = 12;
   const anchorY = priceToY(anchor.price, priceRange, plot);
-  const minTopPrice = yToPrice(anchorY - minHeightPx, priceRange, plot);
-  if (Math.abs(priceToY(p0.price, priceRange, plot) - priceToY(p1.price, priceRange, plot)) < minHeightPx) {
-    if (p0.price >= p1.price) {
-      p0.price = Math.max(p0.price, minTopPrice);
-      p1.price = anchor.price;
-    } else {
-      p1.price = Math.max(p1.price, minTopPrice);
-      p0.price = anchor.price;
+
+  if (isUpperAnchor) {
+    // Never go above the upper Trend Line dot
+    p0.price = Math.min(p0.price, anchor.price);
+    p1.price = Math.min(p1.price, anchor.price);
+
+    const maxBottomPrice = yToPrice(anchorY + minHeightPx, priceRange, plot);
+    if (Math.abs(priceToY(p0.price, priceRange, plot) - priceToY(p1.price, priceRange, plot)) < minHeightPx) {
+      if (p0.price >= p1.price) {
+        p0.price = anchor.price;
+        p1.price = Math.min(p1.price, maxBottomPrice);
+      } else {
+        p1.price = anchor.price;
+        p0.price = Math.min(p0.price, maxBottomPrice);
+      }
+    }
+  } else {
+    // Never go below the anchored Trend Line touch/end price
+    p0.price = Math.max(p0.price, anchor.price);
+    p1.price = Math.max(p1.price, anchor.price);
+
+    // Ensure box keeps non-zero height above anchor.price
+    const minTopPrice = yToPrice(anchorY - minHeightPx, priceRange, plot);
+    if (Math.abs(priceToY(p0.price, priceRange, plot) - priceToY(p1.price, priceRange, plot)) < minHeightPx) {
+      if (p0.price >= p1.price) {
+        p0.price = Math.max(p0.price, minTopPrice);
+        p1.price = anchor.price;
+      } else {
+        p1.price = Math.max(p1.price, minTopPrice);
+        p0.price = anchor.price;
+      }
     }
   }
 
