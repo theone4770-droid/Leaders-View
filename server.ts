@@ -91,7 +91,7 @@ const BINANCE_REST_BASES = [
   'https://api3.binance.com',
 ];
 
-let preferredBinanceBase = BINANCE_REST_BASES[0];
+const binanceHostBlockedUntil = new Map<string, number>();
 
 async function fetchSingleMirror<T>(base: string, endpointPath: string, timeoutMs: number): Promise<{ base: string; data: T }> {
   const controller = new AbortController();
@@ -102,6 +102,9 @@ async function fetchSingleMirror<T>(base: string, endpointPath: string, timeoutM
       headers: { Accept: 'application/json' },
     });
     if (!res.ok) {
+      if ((res.status === 418 || res.status === 451 || res.status === 403 || res.status === 429) && base !== 'https://data-api.binance.vision') {
+        binanceHostBlockedUntil.set(base, Date.now() + 10 * 60_000);
+      }
       throw new Error(`HTTP ${res.status} from ${base}`);
     }
     const data = (await res.json()) as T;
@@ -126,7 +129,7 @@ async function fetchBinanceFuturesJson<T>(endpointPath: string): Promise<T> {
       headers: { Accept: 'application/json' },
     });
     if (!res.ok) {
-      if (res.status === 451 || res.status === 403 || res.status === 429) {
+      if (res.status === 451 || res.status === 403 || res.status === 418 || res.status === 429) {
         fapiFuturesBlockedUntil = Date.now() + 5 * 60_000;
       }
       throw new Error(`HTTP ${res.status} from ${base}`);
@@ -143,28 +146,18 @@ async function fetchBinanceFuturesJson<T>(endpointPath: string): Promise<T> {
 }
 
 async function fetchBinanceJson<T>(endpointPath: string): Promise<T> {
-  // Hedge top 2 mirrors in parallel so a stalled mirror never adds 3.5s latency
-  const primary = preferredBinanceBase;
-  const secondary =
-    primary === 'https://data-api.binance.vision'
-      ? 'https://api.binance.com'
-      : 'https://data-api.binance.vision';
-
+  // Always prioritize Binance's cloud-safe market data CDN first (immune to 418/451 IP blocks)
   try {
-    const winner = await Promise.any([
-      fetchSingleMirror<T>(primary, endpointPath, 2600),
-      fetchSingleMirror<T>(secondary, endpointPath, 2600),
-    ]);
-    preferredBinanceBase = winner.base;
-    return winner.data;
-  } catch {
-    // Fallback to remaining mirrors if both top mirrors fail
-    let lastError: unknown = null;
+    const cdn = await fetchSingleMirror<T>('https://data-api.binance.vision', endpointPath, 4200);
+    return cdn.data;
+  } catch (cdnErr) {
+    const now = Date.now();
+    let lastError: unknown = cdnErr;
     for (const base of BINANCE_REST_BASES) {
-      if (base === primary || base === secondary) continue;
+      if (base === 'https://data-api.binance.vision') continue;
+      if ((binanceHostBlockedUntil.get(base) || 0) > now) continue;
       try {
-        const res = await fetchSingleMirror<T>(base, endpointPath, 3000);
-        preferredBinanceBase = res.base;
+        const res = await fetchSingleMirror<T>(base, endpointPath, 2800);
         return res.data;
       } catch (err) {
         lastError = err;
@@ -511,6 +504,91 @@ async function fetchCoinbaseBtcCandles(
   return result;
 }
 
+async function fetchCoinbaseBtcSubMinuteCandles(
+  interval: string,
+  limit = 350,
+  endTime?: number
+): Promise<Candle[]> {
+  const spec = INTERVAL_MAP[interval];
+  if (!spec) return [];
+  const bucketMs = spec.bucketMs || spec.durationMs;
+  const clampedLimit = Math.max(20, Math.min(1000, limit));
+  const buckets = new Map<number, Candle>();
+
+  if (!endTime) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2800);
+      try {
+        const res = await fetch('https://api.exchange.coinbase.com/products/BTC-USD/trades?limit=1000', {
+          signal: controller.signal,
+          headers: { Accept: 'application/json', 'User-Agent': 'LeadersView/1.0' },
+        });
+        if (res.ok) {
+          const trades = (await res.json()) as Array<{ time?: string; price?: string; size?: string }>;
+          for (let i = trades.length - 1; i >= 0; i--) {
+            const tr = trades[i];
+            const ts = tr.time ? Date.parse(tr.time) : NaN;
+            const price = Number(tr.price);
+            const qty = Number(tr.size) || 0;
+            if (!Number.isFinite(ts) || !Number.isFinite(price) || price <= 0) continue;
+            const bTime = Math.floor(ts / bucketMs) * bucketMs;
+            const ex = buckets.get(bTime);
+            if (!ex) {
+              buckets.set(bTime, { time: bTime, open: price, high: price, low: price, close: price, volume: qty });
+            } else {
+              if (price > ex.high) ex.high = price;
+              if (price < ex.low) ex.low = price;
+              ex.close = price;
+              ex.volume += qty;
+            }
+          }
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {
+      // ignore trade burst failure and rely on 1m expansion below
+    }
+  }
+
+  let dense: Candle[] = Array.from(buckets.values()).sort((a, b) => a.time - b.time);
+  if (dense.length < clampedLimit) {
+    const neededBars = clampedLimit - dense.length;
+    const neededMinutes = Math.min(350, Math.ceil((neededBars * bucketMs) / 60_000) + 5);
+    const cb1m = await fetchCoinbaseBtcCandles('1m', neededMinutes, endTime);
+    if (cb1m && cb1m.length > 0) {
+      const subPerMin = Math.max(1, Math.round(60_000 / bucketMs));
+      const expanded: Candle[] = [];
+      const cutoff = dense.length > 0 ? dense[0].time : Number.MAX_SAFE_INTEGER;
+      for (const m of cb1m) {
+        const stepDelta = (m.close - m.open) / subPerMin;
+        for (let s = 0; s < subPerMin; s++) {
+          const t = m.time + s * bucketMs;
+          if (t >= cutoff) break;
+          const o = s === 0 ? m.open : m.open + stepDelta * s;
+          const c = s === subPerMin - 1 ? m.close : m.open + stepDelta * (s + 1);
+          const h = s === 0 ? Math.max(o, c, m.high) : Math.max(o, c);
+          const l = s === subPerMin - 1 ? Math.min(o, c, m.low) : Math.min(o, c);
+          expanded.push({
+            time: t,
+            open: roundPrice(o),
+            high: roundPrice(h),
+            low: roundPrice(l),
+            close: roundPrice(c),
+            volume: m.volume / subPerMin,
+          });
+        }
+      }
+      dense = [...expanded, ...dense];
+    }
+  }
+  if (dense.length > clampedLimit) {
+    dense = dense.slice(dense.length - clampedLimit);
+  }
+  return dense;
+}
+
 let spotInitPromise: Promise<void> | null = null;
 async function ensureSpotCalibration(): Promise<void> {
   if (xauSpotPrice > 0 && btcSpotPrice > 0) return;
@@ -562,7 +640,8 @@ const OKX_BAR_MAP: Record<string, { bar: string; bucketMs?: number; monthFactor?
 
 let okxBlockedUntil = 0;
 
-async function fetchOkxXauCandles(
+async function fetchOkxCandles(
+  instId: 'XAU-USDT-SWAP' | 'BTC-USDT',
   interval: string,
   limit = 350,
   endTime?: number
@@ -586,14 +665,14 @@ async function fetchOkxXauCandles(
 
   for (let p = 0; p < pagesNeeded; p++) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 1800);
+    const timeout = setTimeout(() => controller.abort(), 2200);
     try {
       const useHistoryEndpoint = Boolean(cursorAfter) && p > 0;
       const endpoint = useHistoryEndpoint ? 'history-candles' : 'candles';
       const reqLimit = Math.min(useHistoryEndpoint ? 100 : 300, totalNeeded - allBase.length);
       if (reqLimit <= 0) break;
       const qs = new URLSearchParams({
-        instId: 'XAU-USDT-SWAP',
+        instId,
         bar: okxSpec.bar,
         limit: String(reqLimit),
       });
@@ -605,7 +684,9 @@ async function fetchOkxXauCandles(
         headers: { Accept: 'application/json', 'User-Agent': 'LeadersView/1.0' },
       });
       if (!res.ok) {
-        if (p === 0) okxBlockedUntil = Date.now() + 5 * 60_000;
+        if (p === 0 && (res.status === 403 || res.status === 429 || res.status === 451)) {
+          okxBlockedUntil = Date.now() + 5 * 60_000;
+        }
         return allBase.length > 0 ? allBase : null;
       }
       const body = (await res.json()) as { code?: string; data?: string[][] };
@@ -734,7 +815,8 @@ const KRAKEN_INTERVAL_MAP: Record<string, { krakenMin: number; bucketMs?: number
   '12M': { krakenMin: 1440, monthFactor: 12 },
 };
 
-async function fetchKrakenPaxgCandles(
+async function fetchKrakenCandles(
+  pair: 'PAXGUSD' | 'XBTUSD',
   interval: string,
   limit = 350,
   endTime?: number
@@ -745,7 +827,7 @@ async function fetchKrakenPaxgCandles(
   const timeout = setTimeout(() => controller.abort(), 3200);
   try {
     const qs = new URLSearchParams({
-      pair: 'PAXGUSD',
+      pair,
       interval: String(kSpec.krakenMin),
     });
     const res = await fetch(`https://api.kraken.com/0/public/OHLC?${qs.toString()}`, {
@@ -754,7 +836,9 @@ async function fetchKrakenPaxgCandles(
     });
     if (!res.ok) return null;
     const body = (await res.json()) as { error?: string[]; result?: Record<string, unknown> };
-    const rows = body.result?.PAXGUSD;
+    const resultEntries = body.result ? Object.entries(body.result) : [];
+    const seriesEntry = resultEntries.find(([k, v]) => k !== 'last' && Array.isArray(v));
+    const rows = seriesEntry?.[1];
     if (!Array.isArray(rows) || rows.length === 0) return null;
     const parsed: Candle[] = [];
     for (const row of rows as Array<Array<string | number>>) {
@@ -1127,7 +1211,7 @@ async function fetchHistoricalCandles(
 
     // 2. Fallback to OKX XAU-USDT-SWAP perpetual candles
     if (result.length === 0) {
-      const okxCandles = await fetchOkxXauCandles(interval, clampedLimit, endTime);
+      const okxCandles = await fetchOkxCandles('XAU-USDT-SWAP', interval, clampedLimit, endTime);
       if (okxCandles && okxCandles.length > 0) {
         result = okxCandles;
         xauSource = 'okx_xau';
@@ -1149,61 +1233,80 @@ async function fetchHistoricalCandles(
 
     // 4. Final fallback to US-regulated Kraken Spot PAXG/USD
     if (result.length === 0) {
-      const krakenCandles = await fetchKrakenPaxgCandles(interval, clampedLimit, endTime);
+      const krakenCandles = await fetchKrakenCandles('PAXGUSD', interval, clampedLimit, endTime);
       if (krakenCandles && krakenCandles.length > 0) {
         result = krakenCandles;
         xauSource = 'kraken_paxg';
       }
     }
   } else {
+    // BTCUSD multi-provider fallback chain (Binance Data CDN -> Coinbase sub-min -> OKX BTC-USDT -> Kraken XBTUSD)
     const multiplier = spec.bucketMs
       ? Math.max(1, Math.round(spec.bucketMs / (INTERVAL_MAP[spec.native]?.durationMs || 1000)))
       : spec.monthFactor || 1;
 
-    // Fetch genuine base candles in up to 3 consecutive pages if aggregation requires more bars
-    const totalNeeded = Math.min(3000, clampedLimit * multiplier + multiplier);
-    const pagesNeeded = Math.min(3, Math.ceil(totalNeeded / 1000));
-    let allBase: Candle[] = [];
-    let cursorEnd = endTime;
+    try {
+      const totalNeeded = Math.min(3000, clampedLimit * multiplier + multiplier);
+      const pagesNeeded = Math.min(3, Math.ceil(totalNeeded / 1000));
+      let allBase: Candle[] = [];
+      let cursorEnd = endTime;
 
-    for (let p = 0; p < pagesNeeded; p++) {
-      const reqLimit = Math.min(1000, totalNeeded - allBase.length);
-      if (reqLimit <= 0) break;
-      const params = new URLSearchParams({
-        symbol: cfg.providerSymbol,
-        interval: spec.native,
-        limit: String(reqLimit),
-      });
-      if (cursorEnd && Number.isFinite(cursorEnd)) {
-        params.set('endTime', String(Math.floor(cursorEnd)));
+      for (let p = 0; p < pagesNeeded; p++) {
+        const reqLimit = Math.min(1000, totalNeeded - allBase.length);
+        if (reqLimit <= 0) break;
+        const params = new URLSearchParams({
+          symbol: cfg.providerSymbol,
+          interval: spec.native,
+          limit: String(reqLimit),
+        });
+        if (cursorEnd && Number.isFinite(cursorEnd)) {
+          params.set('endTime', String(Math.floor(cursorEnd)));
+        }
+        if (startTime && Number.isFinite(startTime) && pagesNeeded === 1) {
+          params.set('startTime', String(Math.floor(startTime)));
+        }
+        const raw = await fetchBinanceJson<unknown[][]>(`/api/v3/klines?${params.toString()}`);
+        const parsed = parseBinanceKlines(raw);
+        if (parsed.length === 0) break;
+        allBase = [...parsed, ...allBase];
+        cursorEnd = parsed[0].time - 1;
+        if (parsed.length < reqLimit) break;
       }
-      if (startTime && Number.isFinite(startTime) && pagesNeeded === 1) {
-        params.set('startTime', String(Math.floor(startTime)));
+
+      const dedupedMap = new Map<number, Candle>();
+      for (const c of allBase) {
+        dedupedMap.set(c.time, c);
       }
-      const raw = await fetchBinanceJson<unknown[][]>(`/api/v3/klines?${params.toString()}`);
-      const parsed = parseBinanceKlines(raw);
-      if (parsed.length === 0) break;
-      allBase = [...parsed, ...allBase];
-      cursorEnd = parsed[0].time - 1;
-      if (parsed.length < reqLimit) break;
+      result = Array.from(dedupedMap.values()).sort((a, b) => a.time - b.time);
+
+      if (spec.bucketMs) {
+        result = aggregateCandlesByMs(result, spec.bucketMs);
+      } else if (spec.monthFactor) {
+        result = aggregateCandlesByMonths(result, spec.monthFactor);
+      }
+      if (result.length > clampedLimit) {
+        result = result.slice(result.length - clampedLimit);
+      }
+    } catch {
+      // Binance failed/rate-limited on shared cloud IP -> fall through to Coinbase/OKX/Kraken
     }
 
-    // Deduplicate base candles
-    const dedupedMap = new Map<number, Candle>();
-    for (const c of allBase) {
-      dedupedMap.set(c.time, c);
-    }
-    const deduped = Array.from(dedupedMap.values()).sort((a, b) => a.time - b.time);
-
-    result = deduped;
-    if (spec.bucketMs) {
-      result = aggregateCandlesByMs(deduped, spec.bucketMs);
-    } else if (spec.monthFactor) {
-      result = aggregateCandlesByMonths(deduped, spec.monthFactor);
+    if (result.length === 0 && spec.native === '1s') {
+      result = await fetchCoinbaseBtcSubMinuteCandles(interval, clampedLimit, endTime);
     }
 
-    if (result.length > clampedLimit) {
-      result = result.slice(result.length - clampedLimit);
+    if (result.length === 0) {
+      const okxBtc = await fetchOkxCandles('BTC-USDT', interval, clampedLimit, endTime);
+      if (okxBtc && okxBtc.length > 0) {
+        result = okxBtc;
+      }
+    }
+
+    if (result.length === 0) {
+      const krakenBtc = await fetchKrakenCandles('XBTUSD', interval, clampedLimit, endTime);
+      if (krakenBtc && krakenBtc.length > 0) {
+        result = krakenBtc;
+      }
     }
   }
 
@@ -1716,10 +1819,24 @@ async function startServer() {
         }
       });
 
+      let xauGeoBlocked = false;
+      ws.on('unexpected-response', (_req, res) => {
+        if (res.statusCode === 451 || res.statusCode === 403 || res.statusCode === 418) {
+          xauGeoBlocked = true;
+        }
+        try {
+          ws.terminate();
+        } catch {
+          // ignore
+        }
+      });
+
       ws.on('close', () => {
         if (xauReconnectTimer) return;
         xauReconnectAttempts += 1;
-        const delay = Math.min(15_000, 1000 * Math.pow(1.6, Math.min(xauReconnectAttempts, 6)));
+        const delay = xauGeoBlocked
+          ? 10 * 60_000
+          : Math.min(15_000, 1000 * Math.pow(1.6, Math.min(xauReconnectAttempts, 6)));
         xauReconnectTimer = setTimeout(() => {
           xauReconnectTimer = null;
           connectXauFutures();
@@ -1833,14 +1950,32 @@ async function startServer() {
         }
       });
 
+      let binanceWsGeoBlocked = false;
+      ws.on('unexpected-response', (_req, res) => {
+        if (res.statusCode === 451 || res.statusCode === 403 || res.statusCode === 418) {
+          binanceWsGeoBlocked = true;
+        }
+        try {
+          ws.terminate();
+        } catch {
+          // ignore
+        }
+      });
+
       ws.on('close', () => {
-        connectionStatus = Object.keys(liveTickers).length > 0 ? 'DELAYED' : 'DISCONNECTED';
-        broadcast({
-          type: 'status',
-          connectionStatus,
-          serverTime: Date.now(),
-        });
-        scheduleReconnect();
+        if (upstreamWs === ws) {
+          upstreamWs = null;
+        }
+        const effective = getEffectiveStatus();
+        if (effective !== 'LIVE') {
+          connectionStatus = Object.keys(liveTickers).length > 0 ? 'DELAYED' : 'DISCONNECTED';
+          broadcast({
+            type: 'status',
+            connectionStatus,
+            serverTime: Date.now(),
+          });
+        }
+        scheduleReconnect(binanceWsGeoBlocked ? 10 * 60_000 : undefined);
       });
 
       ws.on('error', () => {
@@ -1855,10 +1990,11 @@ async function startServer() {
     }
   };
 
-  const scheduleReconnect = () => {
+  const scheduleReconnect = (overrideDelayMs?: number) => {
     if (reconnectTimer) return;
     reconnectAttempts += 1;
-    const delay = Math.min(15_000, 1000 * Math.pow(1.6, Math.min(reconnectAttempts, 6)));
+    const delay =
+      overrideDelayMs ?? Math.min(15_000, 1000 * Math.pow(1.6, Math.min(reconnectAttempts, 6)));
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connectUpstream();

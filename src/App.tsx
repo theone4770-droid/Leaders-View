@@ -516,13 +516,14 @@ export default function App() {
           );
           if (updated) {
             if (newBarAdded) {
+              const totalBars = candlesRef.current.length;
               setViewports((prev) => {
                 const vp = prev[tick.market];
-                const isNearHead = vp.rightOffset >= candlesRef.current.length - 4;
+                const isNearHead = vp.rightOffset >= totalBars - 4;
                 if (!isNearHead) return prev;
                 return {
                   ...prev,
-                  [tick.market]: { ...vp, rightOffset: vp.rightOffset + 1 },
+                  [tick.market]: { ...vp, rightOffset: Math.max(vp.rightOffset + 1, totalBars + 2) },
                 };
               });
             }

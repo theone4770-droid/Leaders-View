@@ -145,11 +145,23 @@ export function renderBaseChart(params: RenderBaseChartParams): BaseRenderMetric
     const visStart = Math.max(0, startIdx - 1);
     const visEnd = Math.min(candles.length - 1, endIdx + 1);
 
-    const bodyWidth = Math.max(1.5, Math.min(viewport.barSpacing * 0.72, 42));
+    const rawBodyWidth = Math.max(1, Math.min(viewport.barSpacing * 0.72, 42));
+    const maxSafeBody = Math.max(1, Math.floor(viewport.barSpacing - 0.6));
+    const wideWick = viewport.barSpacing > 14;
+    const wickWidth = wideWick ? 2 : 1;
+    let bodyWidth: number;
+    if (wideWick) {
+      bodyWidth = Math.max(4, Math.min(42, Math.floor(rawBodyWidth / 2) * 2));
+    } else if (rawBodyWidth < 2 || maxSafeBody < 3) {
+      bodyWidth = 1;
+    } else {
+      const capped = Math.min(41, Math.round(rawBodyWidth), maxSafeBody);
+      bodyWidth = capped % 2 === 0 ? Math.max(1, capped - 1) : capped;
+    }
     const halfBody = bodyWidth / 2;
+    const wickOffset = wideWick ? 0 : 0.5;
+    const getCrispCenter = (idx: number) => Math.round(indexToX(idx, viewport, plot)) + wickOffset;
 
-    const wickWidth = viewport.barSpacing > 14 ? 1.5 : 1;
-    const wickOffset = wickWidth === 1 ? 0.5 : 0;
     const lastIdx = candles.length - 1;
     const staticEnd = liveCandleOverride && visEnd === lastIdx ? visEnd - 1 : visEnd;
 
@@ -160,14 +172,14 @@ export function renderBaseChart(params: RenderBaseChartParams): BaseRenderMetric
     for (let i = visStart; i <= staticEnd; i++) {
       const c = candles[i];
       if (c.close < c.open) continue;
-      const crispX = Math.round(indexToX(i, viewport, plot)) + wickOffset;
+      const crispX = getCrispCenter(i);
       ctx.moveTo(crispX, priceToY(c.high, priceRange, plot));
       ctx.lineTo(crispX, priceToY(c.low, priceRange, plot));
     }
     if (liveCandleOverride && visEnd === lastIdx && visStart <= lastIdx) {
       const c = candles[lastIdx];
       if (liveCandleOverride.close >= c.open) {
-        const crispX = Math.round(indexToX(lastIdx, viewport, plot)) + wickOffset;
+        const crispX = getCrispCenter(lastIdx);
         ctx.moveTo(crispX, priceToY(liveCandleOverride.high, priceRange, plot));
         ctx.lineTo(crispX, priceToY(liveCandleOverride.low, priceRange, plot));
       }
@@ -180,37 +192,43 @@ export function renderBaseChart(params: RenderBaseChartParams): BaseRenderMetric
     for (let i = visStart; i <= staticEnd; i++) {
       const c = candles[i];
       if (c.close >= c.open) continue;
-      const crispX = Math.round(indexToX(i, viewport, plot)) + wickOffset;
+      const crispX = getCrispCenter(i);
       ctx.moveTo(crispX, priceToY(c.high, priceRange, plot));
       ctx.lineTo(crispX, priceToY(c.low, priceRange, plot));
     }
     if (liveCandleOverride && visEnd === lastIdx && visStart <= lastIdx) {
       const c = candles[lastIdx];
       if (liveCandleOverride.close < c.open) {
-        const crispX = Math.round(indexToX(lastIdx, viewport, plot)) + wickOffset;
+        const crispX = getCrispCenter(lastIdx);
         ctx.moveTo(crispX, priceToY(liveCandleOverride.high, priceRange, plot));
         ctx.lineTo(crispX, priceToY(liveCandleOverride.low, priceRange, plot));
       }
     }
     ctx.stroke();
 
+    const drawCandleBody = (idx: number, openPrice: number, closePrice: number) => {
+      const cx = getCrispCenter(idx);
+      const yOpen = priceToY(openPrice, priceRange, plot);
+      const yClose = priceToY(closePrice, priceRange, plot);
+      const rawTop = Math.min(yOpen, yClose);
+      const rawH = Math.abs(yClose - yOpen);
+      const minBodyH = 1.5;
+      const bodyH = Math.max(minBodyH, rawH);
+      const bodyTop = rawH < minBodyH ? rawTop - (minBodyH - rawH) / 2 : rawTop;
+      ctx.fillRect(cx - halfBody, bodyTop, bodyWidth, bodyH);
+    };
+
     // 3. Bullish bodies
     ctx.fillStyle = palette.candleUp;
     for (let i = visStart; i <= staticEnd; i++) {
       const c = candles[i];
       if (c.close < c.open) continue;
-      const cx = indexToX(i, viewport, plot);
-      const yOpen = priceToY(c.open, priceRange, plot);
-      const yClose = priceToY(c.close, priceRange, plot);
-      ctx.fillRect(cx - halfBody, Math.min(yOpen, yClose), bodyWidth, Math.max(1.2, Math.abs(yClose - yOpen)));
+      drawCandleBody(i, c.open, c.close);
     }
     if (liveCandleOverride && visEnd === lastIdx && visStart <= lastIdx) {
       const c = candles[lastIdx];
       if (liveCandleOverride.close >= c.open) {
-        const cx = indexToX(lastIdx, viewport, plot);
-        const yOpen = priceToY(c.open, priceRange, plot);
-        const yClose = priceToY(liveCandleOverride.close, priceRange, plot);
-        ctx.fillRect(cx - halfBody, Math.min(yOpen, yClose), bodyWidth, Math.max(1.2, Math.abs(yClose - yOpen)));
+        drawCandleBody(lastIdx, c.open, liveCandleOverride.close);
       }
     }
 
@@ -219,18 +237,12 @@ export function renderBaseChart(params: RenderBaseChartParams): BaseRenderMetric
     for (let i = visStart; i <= staticEnd; i++) {
       const c = candles[i];
       if (c.close >= c.open) continue;
-      const cx = indexToX(i, viewport, plot);
-      const yOpen = priceToY(c.open, priceRange, plot);
-      const yClose = priceToY(c.close, priceRange, plot);
-      ctx.fillRect(cx - halfBody, Math.min(yOpen, yClose), bodyWidth, Math.max(1.2, Math.abs(yClose - yOpen)));
+      drawCandleBody(i, c.open, c.close);
     }
     if (liveCandleOverride && visEnd === lastIdx && visStart <= lastIdx) {
       const c = candles[lastIdx];
       if (liveCandleOverride.close < c.open) {
-        const cx = indexToX(lastIdx, viewport, plot);
-        const yOpen = priceToY(c.open, priceRange, plot);
-        const yClose = priceToY(liveCandleOverride.close, priceRange, plot);
-        ctx.fillRect(cx - halfBody, Math.min(yOpen, yClose), bodyWidth, Math.max(1.2, Math.abs(yClose - yOpen)));
+        drawCandleBody(lastIdx, c.open, liveCandleOverride.close);
       }
     }
 
