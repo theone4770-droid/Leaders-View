@@ -23,6 +23,7 @@ import {
   getInitialCandlesSync,
   getInitialTickersSync,
   MarketDataClient,
+  MAX_CHART_CANDLES,
   prefetchMarketsAndIntervals,
   updateCachedCandlesWithTick,
 } from './modules/marketData';
@@ -87,6 +88,7 @@ import { IndicatorsModal } from './components/IndicatorsModal';
 import { AlertsModal } from './components/AlertsModal';
 import { BarReplayControls } from './components/BarReplayControls';
 import { ChartCanvas, ChartCanvasHandle } from './components/ChartCanvas';
+import { usePWAInstall } from './hooks/usePWAInstall';
 
 interface TriggeredToast {
   id: string;
@@ -207,6 +209,7 @@ export default function App() {
   const [isAlertsOpen, setIsAlertsOpen] = useState(false);
   const [isFullScreen, setIsFullScreen] = useState(false);
   const [isFreeCrosshair, setIsFreeCrosshair] = useState(false);
+  const pwaInstall = usePWAInstall();
 
   const chartRef = useRef<ChartCanvasHandle | null>(null);
   const marketRef = useRef(market);
@@ -354,7 +357,11 @@ export default function App() {
           return;
         }
         const prevLen = candlesRef.current.length;
-        const merged = deduplicateAndSortCandles([...older, ...candlesRef.current]);
+        if (prevLen >= MAX_CHART_CANDLES) return;
+        let merged = deduplicateAndSortCandles([...older, ...candlesRef.current]);
+        if (merged.length > MAX_CHART_CANDLES) {
+          merged = merged.slice(merged.length - MAX_CHART_CANDLES);
+        }
         const addedCount = merged.length - prevLen;
         if (addedCount > 0) {
           candlesRef.current = merged;
@@ -1030,6 +1037,10 @@ export default function App() {
         open={isThreeDotsOpen}
         activeAlertsCount={activeAlertsCount}
         isReplayActive={replay.mode !== 'OFF'}
+        canInstallApp={pwaInstall.isInstallable}
+        isInstalledApp={pwaInstall.isInstalled}
+        isIOS={pwaInstall.isIOS}
+        onInstallApp={pwaInstall.install}
         onOpenIndicators={handleOpenIndicators}
         onOpenAlerts={handleOpenAlerts}
         onStartReplay={handleStartReplay}

@@ -204,6 +204,36 @@ export function getBucketEndTime(timestampMs: number, interval: TimeframeId): nu
 
 const pad2 = (n: number): string => (n < 10 ? `0${n}` : `${n}`);
 
+const NY_MARKET_FMT = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  weekday: 'short',
+  hour: '2-digit',
+  hour12: false,
+});
+
+/**
+ * Returns true when the given market is actively trading:
+ * - BTCUSD: 24/7 crypto market (always open)
+ * - XAUUSD: Spot Gold trades Sunday 18:00 through Friday 17:00 America/New_York
+ *           with the daily 17:00-18:00 America/New_York rollover break.
+ */
+export function isMarketOpen(market: MarketSymbol, nowMs: number = Date.now()): boolean {
+  if (market === 'BTCUSD') return true;
+  const parts = NY_MARKET_FMT.formatToParts(new Date(nowMs));
+  let weekday = '';
+  let hour = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (p.type === 'weekday') weekday = p.value;
+    else if (p.type === 'hour') hour = Number(p.value) % 24;
+  }
+  if (weekday === 'Sat') return false;
+  if (weekday === 'Sun') return hour >= 18;
+  if (weekday === 'Fri') return hour < 17;
+  // Mon - Thu daily 1h rollover pause 17:00 - 17:59 ET
+  return hour !== 17;
+}
+
 let cachedCountdownKey = '';
 let cachedCountdownValue = '';
 

@@ -1481,10 +1481,15 @@ async function startServer() {
   });
 
   const broadcast = (payload: Record<string, unknown>) => {
-    const text = JSON.stringify(payload);
+    if (wss.clients.size === 0) return;
+    let text: string | null = null;
     for (const client of wss.clients) {
       if (client.readyState === WebSocket.OPEN) {
+        if (client.bufferedAmount > 262_144) continue;
         try {
+          if (text === null) {
+            text = JSON.stringify(payload);
+          }
           client.send(text);
         } catch {
           // Ignore closed/broken client socket mid-send
@@ -1860,13 +1865,20 @@ async function startServer() {
     }, delay);
   };
 
-  // High-frequency institutional Spot Gold (XAU/USD) quote polling (~1000ms) anchors spot basis smoothly
+  // High-frequency institutional Spot Gold (XAU/USD) quote polling (~1000ms while clients are connected)
   let xauPollActive = false;
-  setInterval(async () => {
+  let lastIdleSpotPollAt = 0;
+  const xauPollInterval = setInterval(async () => {
     if (xauPollActive) return;
+    const nowCheck = Date.now();
+    // Skip 1s polling when no browser clients are connected (at most 1 lightweight refresh every 60s when idle)
+    if (wss.clients.size === 0 && nowCheck - lastIdleSpotPollAt < 60_000) {
+      return;
+    }
     xauPollActive = true;
+    lastIdleSpotPollAt = nowCheck;
     try {
-      const spot = await fetchSwissquoteXauSpot();
+      const spot = (await fetchSwissquoteXauSpot()) ?? (wss.clients.size > 0 ? await fetchGoldApiSpot() : null);
       if (spot && spot > 0) {
         const now = Date.now();
         xauSpotPrice = spot;
@@ -1874,7 +1886,7 @@ async function startServer() {
         lastUpstreamMessageAt = now;
 
         const existing = liveTickers.XAUUSD;
-        // Only broadcast directly from REST poll if futures stream hasn't ticked recently or price drifted >= 0.02
+        // Only broadcast directly from REST poll if futures stream hasn't ticked recently or price drifted
         if (!existing || (now - lastTradeAt.XAUUSD > 1200 && existing.price !== spot)) {
           const tickTs = nextMonotonicTickTs('XAUUSD');
           const open24h = existing?.open24h || spot;
@@ -1895,14 +1907,16 @@ async function startServer() {
             timestamp: tickTs,
           };
           liveTickers.XAUUSD = updatedTicker;
-          broadcast({
-            type: 'tick',
-            market: 'XAUUSD',
-            price: spot,
-            volume: 0,
-            timestamp: tickTs,
-            ticker: updatedTicker,
-          });
+          if (wss.clients.size > 0) {
+            broadcast({
+              type: 'tick',
+              market: 'XAUUSD',
+              price: spot,
+              volume: 0,
+              timestamp: tickTs,
+              ticker: updatedTicker,
+            });
+          }
         }
       }
     } catch {
@@ -1912,14 +1926,30 @@ async function startServer() {
     }
   }, 1000);
 
-  // Server-side 2s micro-cache + in-flight deduplication for head klines queries
+  // Bounded server-side 2s micro-cache + in-flight deduplication for head klines queries
+  const MAX_KLINE_CACHE_ENTRIES = 8;
+  const KLINE_CACHE_TTL_MS = 2000;
   const klineCache = new Map<string, { candles: Candle[]; cachedAt: number }>();
   const klineInFlight = new Map<string, Promise<Candle[]>>();
 
+  const pruneKlineCache = (now: number) => {
+    for (const [k, v] of klineCache.entries()) {
+      if (now - v.cachedAt > KLINE_CACHE_TTL_MS * 3) {
+        klineCache.delete(k);
+      }
+    }
+    while (klineCache.size > MAX_KLINE_CACHE_ENTRIES) {
+      const oldest = klineCache.keys().next().value;
+      if (!oldest) break;
+      klineCache.delete(oldest);
+    }
+  };
+
   const getHeadCandlesFast = async (market: MarketSymbol, interval: string, limit: number): Promise<Candle[]> => {
     const key = `${market}:${interval}:${limit}`;
+    const now = Date.now();
     const existing = klineCache.get(key);
-    if (existing && Date.now() - existing.cachedAt < 2000) {
+    if (existing && now - existing.cachedAt < KLINE_CACHE_TTL_MS) {
       return existing.candles;
     }
     const inflight = klineInFlight.get(key);
@@ -1928,7 +1958,10 @@ async function startServer() {
     const p = fetchHistoricalCandles(market, interval, limit)
       .then((candles) => {
         if (candles.length > 0) {
-          klineCache.set(key, { candles, cachedAt: Date.now() });
+          const ts = Date.now();
+          if (klineCache.has(key)) klineCache.delete(key);
+          klineCache.set(key, { candles, cachedAt: ts });
+          pruneKlineCache(ts);
         }
         return candles;
       })
@@ -1939,16 +1972,16 @@ async function startServer() {
     return p;
   };
 
-  // Non-blocking initial REST snapshot, klines warm-up, & upstream WS launch so HTTP/Vite binds immediately
+  // Non-blocking initial REST snapshot, primary XAUUSD warm-up, & upstream WS launch
   void refreshTickersFromRest();
   void getHeadCandlesFast('XAUUSD', '15m', 400).catch(() => {});
-  void getHeadCandlesFast('BTCUSD', '15m', 400).catch(() => {});
   connectCoinbase();
   connectXauFutures();
   connectUpstream();
 
-  // Periodic fallback REST check if WS is degraded
-  setInterval(async () => {
+  // Periodic fallback REST check if WS is degraded (only when clients are connected)
+  const fallbackPollInterval = setInterval(async () => {
+    if (wss.clients.size === 0) return;
     try {
       const status = getEffectiveStatus();
       if (status !== 'LIVE') {
@@ -1965,7 +1998,32 @@ async function startServer() {
     }
   }, 10_000);
 
+  // Heartbeat to drop dead/half-open mobile WebSocket connections and keep memory bounded
+  const aliveClients = new WeakMap<WebSocket, boolean>();
+  const wsHeartbeatInterval = setInterval(() => {
+    for (const client of wss.clients) {
+      if (aliveClients.get(client) === false) {
+        try {
+          client.terminate();
+        } catch {
+          // ignore
+        }
+        continue;
+      }
+      aliveClients.set(client, false);
+      try {
+        client.ping();
+      } catch {
+        // ignore
+      }
+    }
+  }, 30_000);
+
   wss.on('connection', (client) => {
+    aliveClients.set(client, true);
+    client.on('pong', () => {
+      aliveClients.set(client, true);
+    });
     client.on('error', () => {
       // Ignore abrupt mobile client disconnects
     });
@@ -1983,6 +2041,7 @@ async function startServer() {
     }
 
     client.on('message', (raw) => {
+      aliveClients.set(client, true);
       try {
         const msg = JSON.parse(raw.toString()) as { type?: string };
         if (msg.type === 'ping') {
@@ -1993,6 +2052,55 @@ async function startServer() {
       }
     });
   });
+
+  const cleanupResources = () => {
+    clearInterval(xauPollInterval);
+    clearInterval(fallbackPollInterval);
+    clearInterval(wsHeartbeatInterval);
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (xauReconnectTimer) {
+      clearTimeout(xauReconnectTimer);
+      xauReconnectTimer = null;
+    }
+    if (coinbaseReconnectTimer) {
+      clearTimeout(coinbaseReconnectTimer);
+      coinbaseReconnectTimer = null;
+    }
+    klineCache.clear();
+    klineInFlight.clear();
+    for (const sock of [upstreamWs, xauFuturesWs, coinbaseWs]) {
+      if (sock) {
+        try {
+          sock.removeAllListeners();
+          sock.terminate();
+        } catch {
+          // ignore
+        }
+      }
+    }
+    upstreamWs = null;
+    xauFuturesWs = null;
+    coinbaseWs = null;
+    for (const client of wss.clients) {
+      try {
+        client.terminate();
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      wss.close();
+      server.close();
+    } catch {
+      // ignore
+    }
+  };
+
+  process.once('SIGTERM', cleanupResources);
+  process.once('SIGINT', cleanupResources);
 
   app.use(express.json());
 
@@ -2069,12 +2177,25 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
+    app.use(
+      express.static(distPath, {
+        setHeaders: (res, filePath) => {
+          if (
+            filePath.endsWith('sw.js') ||
+            filePath.endsWith('manifest.webmanifest') ||
+            filePath.endsWith('index.html')
+          ) {
+            res.setHeader('Cache-Control', 'no-cache');
+          }
+        },
+      })
+    );
     app.get('*', (req, res) => {
       if (req.path.startsWith('/api/')) {
         res.status(404).json({ error: 'Not found' });
         return;
       }
+      res.setHeader('Cache-Control', 'no-cache');
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

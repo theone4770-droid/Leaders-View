@@ -17,6 +17,8 @@ export interface FibSettingsPreset {
   fibReverse: boolean;
 }
 
+export type FavoritesBarOrientation = 'landscape' | 'portrait';
+
 const KEYS = {
   MARKET: 'lv_selected_market_v1',
   THEME: 'lv_theme_v1',
@@ -26,6 +28,7 @@ const KEYS = {
   FAVORITES: 'lv_favorites_v1',
   SHOW_FAV_BAR: 'lv_show_favorites_bar_v1',
   FAV_BAR_POS: 'lv_fav_bar_pos_v1',
+  FAV_BAR_ORIENTATION: 'lv_fav_bar_orientation_v1',
   PROP_BAR_POS: 'lv_prop_bar_pos_v1',
   ALERTS: 'lv_alerts_v1',
   FIB_PRESET: 'lv_fib_preset_v1',
@@ -121,6 +124,15 @@ export function loadFavoritesBarPosition(): { x: number; y: number } | null {
 
 export function saveFavoritesBarPosition(pos: { x: number; y: number }): void {
   safeWrite(KEYS.FAV_BAR_POS, pos);
+}
+
+export function loadFavoritesBarOrientation(): FavoritesBarOrientation {
+  const val = safeRead<string>(KEYS.FAV_BAR_ORIENTATION, 'landscape');
+  return val === 'portrait' ? 'portrait' : 'landscape';
+}
+
+export function saveFavoritesBarOrientation(orientation: FavoritesBarOrientation): void {
+  safeWrite(KEYS.FAV_BAR_ORIENTATION, orientation);
 }
 
 export function loadPropBarPosition(): { x: number; y: number } | null {

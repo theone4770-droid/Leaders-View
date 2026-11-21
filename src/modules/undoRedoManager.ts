@@ -8,7 +8,7 @@ export interface MarketHistoryStack {
 
 export type AllMarketHistory = Record<MarketSymbol, MarketHistoryStack>;
 
-const MAX_HISTORY_STEPS = 120;
+const MAX_HISTORY_STEPS = 40;
 
 function cloneDrawings(drawings: DrawingObject[]): DrawingObject[] {
   return drawings.map((d) => ({

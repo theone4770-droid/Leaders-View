@@ -189,179 +189,187 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
           style={style}
           onPointerDown={startDrag}
           data-testid="drawing-properties-bar"
-          className="lv-gpu-layer fixed z-30 flex flex-nowrap items-center gap-1.5 w-max max-w-[calc(100vw-16px)] overflow-x-auto no-scrollbar whitespace-nowrap rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF]/96 dark:bg-[#101013]/96 px-2.5 py-1.5 shadow-2xl select-none"
+          className="lv-gpu-layer fixed z-30 flex items-center w-max max-w-[calc(100vw-16px)] rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF]/96 dark:bg-[#101013]/96 px-2 py-1.5 shadow-2xl select-none"
         >
-          {/* Movable drag grip handle */}
-          <div
-            data-drag-handle="true"
-            onPointerDown={startDrag}
-            onDoubleClick={resetPosition}
-            title="DRAG TO MOVE TOOLBAR (DOUBLE-CLICK TO RESET)"
-            className="flex h-7 w-5 items-center justify-center rounded text-[#141311] dark:text-[#FFFFFF] hover:bg-[#141311]/10 dark:hover:bg-[#FFFFFF]/15 cursor-grab active:cursor-grabbing touch-none shrink-0"
-          >
-            <GripVertical className="w-4 h-4" />
-          </div>
+          {/* Horizontally scrollable tool style & properties strip */}
+          <div className="flex flex-nowrap items-center gap-1.5 min-w-0 flex-1 overflow-x-auto no-scrollbar whitespace-nowrap pr-1.5">
+            {/* Movable drag grip handle */}
+            <div
+              data-drag-handle="true"
+              onPointerDown={startDrag}
+              onDoubleClick={resetPosition}
+              title="DRAG TO MOVE TOOLBAR (DOUBLE-CLICK TO RESET)"
+              className="flex h-7 w-5 items-center justify-center rounded text-[#141311] dark:text-[#FFFFFF] hover:bg-[#141311]/10 dark:hover:bg-[#FFFFFF]/15 cursor-grab active:cursor-grabbing touch-none shrink-0"
+            >
+              <GripVertical className="w-4 h-4" />
+            </div>
 
-          <span
-            title="DRAG TO MOVE TOOLBAR"
-            className="text-[10.5px] font-bold tracking-[0.12em] text-[#141311] dark:text-[#FFFFFF] whitespace-nowrap cursor-grab active:cursor-grabbing touch-none shrink-0"
-          >
-            {toolDef?.name ?? 'DRAWING'}
-          </span>
+            <span
+              title="DRAG TO MOVE TOOLBAR"
+              className="text-[10.5px] font-bold tracking-[0.12em] text-[#141311] dark:text-[#FFFFFF] whitespace-nowrap cursor-grab active:cursor-grabbing touch-none shrink-0"
+            >
+              {toolDef?.name ?? 'DRAWING'}
+            </span>
 
-          <div className="h-4 w-px shrink-0 bg-[#141311]/20 dark:bg-[#FFFFFF]/20" />
+            <div className="h-4 w-px shrink-0 bg-[#141311]/20 dark:bg-[#FFFFFF]/20" />
 
-          {/* Color swatches */}
-          <div className="flex items-center gap-1 shrink-0">
-            {SWATCHES.map((hex) => (
-              <button
-                key={hex}
-                type="button"
-                onClick={() => onUpdate({ style: { ...drawing.style, color: hex } })}
-                aria-label={`Set color ${hex}`}
-                className={`h-4.5 w-4.5 shrink-0 rounded-full border transition-transform cursor-pointer ${
-                  drawing.style.color.toLowerCase() === hex.toLowerCase()
-                    ? 'scale-110 border-[#141311] dark:border-[#FFFFFF] ring-2 ring-[#141311]/35 dark:ring-[#FFFFFF]/40'
-                    : 'border-black/25 dark:border-white/25'
-                }`}
-                style={{ backgroundColor: hex }}
+            {/* Color swatches */}
+            <div className="flex items-center gap-1 shrink-0">
+              {SWATCHES.map((hex) => (
+                <button
+                  key={hex}
+                  type="button"
+                  onClick={() => onUpdate({ style: { ...drawing.style, color: hex } })}
+                  aria-label={`Set color ${hex}`}
+                  className={`h-4.5 w-4.5 shrink-0 rounded-full border transition-transform cursor-pointer ${
+                    drawing.style.color.toLowerCase() === hex.toLowerCase()
+                      ? 'scale-110 border-[#141311] dark:border-[#FFFFFF] ring-2 ring-[#141311]/35 dark:ring-[#FFFFFF]/40'
+                      : 'border-black/25 dark:border-white/25'
+                  }`}
+                  style={{ backgroundColor: hex }}
+                />
+              ))}
+              <input
+                type="color"
+                value={drawing.style.color}
+                onChange={(e) => onUpdate({ style: { ...drawing.style, color: e.target.value } })}
+                aria-label="Custom color"
+                className="h-5 w-5 shrink-0 rounded cursor-pointer border border-[#141311]/35 dark:border-[#FFFFFF]/40 bg-transparent p-0"
               />
-            ))}
-            <input
-              type="color"
-              value={drawing.style.color}
-              onChange={(e) => onUpdate({ style: { ...drawing.style, color: e.target.value } })}
-              aria-label="Custom color"
-              className="h-5 w-5 shrink-0 rounded cursor-pointer border border-[#141311]/35 dark:border-[#FFFFFF]/40 bg-transparent p-0"
-            />
-          </div>
+            </div>
 
-          <div className="h-4 w-px shrink-0 bg-[#141311]/20 dark:bg-[#FFFFFF]/20" />
+            <div className="h-4 w-px shrink-0 bg-[#141311]/20 dark:bg-[#FFFFFF]/20" />
 
-          {/* Line thickness */}
-          <div className="flex items-center gap-1 shrink-0">
-            {[1, 2, 3, 4].map((w) => (
-              <button
-                key={w}
-                type="button"
-                onClick={() => onUpdate({ style: { ...drawing.style, lineWidth: w } })}
-                className={`h-6 w-6 shrink-0 rounded text-[11px] font-mono-num font-bold border cursor-pointer ${
-                  drawing.style.lineWidth === w
-                    ? 'border-[#141311] dark:border-[#FFFFFF] bg-[#141311]/15 dark:bg-[#FFFFFF]/20 text-[#141311] dark:text-[#FFFFFF]'
-                    : 'border-transparent text-[#625D52] dark:text-[#9A9892] hover:border-[#141311]/40 dark:hover:border-[#FFFFFF]/40'
-                }`}
-              >
-                {w}
-              </button>
-            ))}
-          </div>
+            {/* Line thickness */}
+            <div className="flex items-center gap-1 shrink-0">
+              {[1, 2, 3, 4].map((w) => (
+                <button
+                  key={w}
+                  type="button"
+                  onClick={() => onUpdate({ style: { ...drawing.style, lineWidth: w } })}
+                  className={`h-6 w-6 shrink-0 rounded text-[11px] font-mono-num font-bold border cursor-pointer ${
+                    drawing.style.lineWidth === w
+                      ? 'border-[#141311] dark:border-[#FFFFFF] bg-[#141311]/15 dark:bg-[#FFFFFF]/20 text-[#141311] dark:text-[#FFFFFF]'
+                      : 'border-transparent text-[#625D52] dark:text-[#9A9892] hover:border-[#141311]/40 dark:hover:border-[#FFFFFF]/40'
+                  }`}
+                >
+                  {w}
+                </button>
+              ))}
+            </div>
 
-          {/* Line style */}
-          <div className="flex items-center gap-1 shrink-0">
-            {(['solid', 'dashed', 'dotted'] as LineStyleType[]).map((st) => (
-              <button
-                key={st}
-                type="button"
-                onClick={() => onUpdate({ style: { ...drawing.style, lineStyle: st } })}
-                className={`px-2 h-6 shrink-0 rounded text-[10px] font-bold tracking-wider uppercase border cursor-pointer ${
-                  drawing.style.lineStyle === st
-                    ? 'border-[#141311] dark:border-[#FFFFFF] bg-[#141311]/15 dark:bg-[#FFFFFF]/20 text-[#141311] dark:text-[#FFFFFF]'
-                    : 'border-transparent text-[#625D52] dark:text-[#9A9892] hover:border-[#141311]/40 dark:hover:border-[#FFFFFF]/40'
-                }`}
-              >
-                {st.slice(0, 3)}
-              </button>
-            ))}
-          </div>
+            {/* Line style */}
+            <div className="flex items-center gap-1 shrink-0">
+              {(['solid', 'dashed', 'dotted'] as LineStyleType[]).map((st) => (
+                <button
+                  key={st}
+                  type="button"
+                  onClick={() => onUpdate({ style: { ...drawing.style, lineStyle: st } })}
+                  className={`px-2 h-6 shrink-0 rounded text-[10px] font-bold tracking-wider uppercase border cursor-pointer ${
+                    drawing.style.lineStyle === st
+                      ? 'border-[#141311] dark:border-[#FFFFFF] bg-[#141311]/15 dark:bg-[#FFFFFF]/20 text-[#141311] dark:text-[#FFFFFF]'
+                      : 'border-transparent text-[#625D52] dark:text-[#9A9892] hover:border-[#141311]/40 dark:hover:border-[#FFFFFF]/40'
+                  }`}
+                >
+                  {st.slice(0, 3)}
+                </button>
+              ))}
+            </div>
 
-          {/* Opacity */}
-          {(() => {
-            const opacityPct = Math.round((drawing.style.opacity ?? 1) * 100);
-            const sliderRatio = Math.max(0, Math.min(1, (opacityPct - 15) / 85));
-            return (
-              <label className="flex items-center gap-1.5 shrink-0 text-[10px] font-mono-num text-[#141311] dark:text-[#FFFFFF]">
-                <span>{opacityPct}%</span>
-                <span className="relative flex h-5 w-14 items-center rounded bg-[#141311]/90 px-1 dark:bg-transparent dark:px-0">
-                  <span className="pointer-events-none relative flex h-full w-full items-center">
-                    <span className="h-px w-full rounded-full bg-[#FACC15]" />
-                    <span
-                      className="absolute top-1/2 h-[9px] w-[2px] -translate-x-1/2 -translate-y-1/2 rounded-[1px] bg-[#FACC15]"
-                      style={{ left: `${sliderRatio * 100}%` }}
+            {/* Opacity */}
+            {(() => {
+              const opacityPct = Math.round((drawing.style.opacity ?? 1) * 100);
+              const sliderRatio = Math.max(0, Math.min(1, (opacityPct - 15) / 85));
+              return (
+                <label className="flex items-center gap-1.5 shrink-0 text-[10px] font-mono-num text-[#141311] dark:text-[#FFFFFF]">
+                  <span>{opacityPct}%</span>
+                  <span className="relative flex h-5 w-14 items-center rounded bg-[#141311]/90 px-1 dark:bg-transparent dark:px-0">
+                    <span className="pointer-events-none relative flex h-full w-full items-center">
+                      <span className="h-px w-full rounded-full bg-[#FACC15]" />
+                      <span
+                        className="absolute top-1/2 h-[9px] w-[2px] -translate-x-1/2 -translate-y-1/2 rounded-[1px] bg-[#FACC15]"
+                        style={{ left: `${sliderRatio * 100}%` }}
+                      />
+                    </span>
+                    <input
+                      type="range"
+                      min={15}
+                      max={100}
+                      value={opacityPct}
+                      onChange={(e) =>
+                        onUpdate({ style: { ...drawing.style, opacity: Number(e.target.value) / 100 } })
+                      }
+                      aria-label="Drawing Opacity"
+                      className="lv-thin-range absolute inset-0 h-full w-full cursor-pointer opacity-0"
                     />
                   </span>
-                  <input
-                    type="range"
-                    min={15}
-                    max={100}
-                    value={opacityPct}
-                    onChange={(e) =>
-                      onUpdate({ style: { ...drawing.style, opacity: Number(e.target.value) / 100 } })
-                    }
-                    aria-label="Drawing Opacity"
-                    className="lv-thin-range absolute inset-0 h-full w-full cursor-pointer opacity-0"
-                  />
-                </span>
-              </label>
-            );
-          })()}
+                </label>
+              );
+            })()}
 
-          {/* Inline text editor for annotation tools */}
-          {supportsText && (
-            <input
-              type="text"
-              value={drawing.text ?? ''}
-              onChange={(e) => onUpdate({ text: e.target.value })}
-              placeholder="Annotation text..."
-              aria-label="Edit drawing text"
-              className="h-7 w-32 sm:w-40 shrink-0 px-2 rounded border border-[#141311]/30 dark:border-[#FFFFFF]/30 bg-[#FBF9F4] dark:bg-[#17171B] text-xs text-[#141311] dark:text-[#F5F5F7] focus:outline-none focus:border-[#141311] dark:focus:border-[#FFFFFF]"
-            />
-          )}
+            {/* Inline text editor for annotation tools */}
+            {supportsText && (
+              <input
+                type="text"
+                value={drawing.text ?? ''}
+                onChange={(e) => onUpdate({ text: e.target.value })}
+                placeholder="Annotation text..."
+                aria-label="Edit drawing text"
+                className="h-7 w-32 sm:w-40 shrink-0 px-2 rounded border border-[#141311]/30 dark:border-[#FFFFFF]/30 bg-[#FBF9F4] dark:bg-[#17171B] text-xs text-[#141311] dark:text-[#F5F5F7] focus:outline-none focus:border-[#141311] dark:focus:border-[#FFFFFF]"
+              />
+            )}
 
-          <div className="h-4 w-px shrink-0 bg-[#141311]/20 dark:bg-[#FFFFFF]/20" />
+            <div className="h-4 w-px shrink-0 bg-[#141311]/20 dark:bg-[#FFFFFF]/20" />
 
-          {/* TradingView-style Settings button for Fibonacci Retracement */}
-          {drawing.toolId === 'fib_retracement' && (
+            {/* TradingView-style Settings button for Fibonacci Retracement */}
+            {drawing.toolId === 'fib_retracement' && (
+              <button
+                type="button"
+                onClick={() => setIsFibSettingsOpen(true)}
+                title="FIBONACCI SETTINGS (SELECT LEVELS)"
+                aria-label="Fibonacci Retracement Settings"
+                data-testid="fib-settings-btn"
+                className="flex h-7 shrink-0 items-center gap-1 rounded px-2 border border-[#141311]/25 dark:border-[#FFFFFF]/30 bg-[#141311]/8 dark:bg-[#FFFFFF]/12 text-[10.5px] font-bold tracking-wider text-[#141311] dark:text-[#FFFFFF] hover:bg-[#141311]/15 dark:hover:bg-[#FFFFFF]/22 cursor-pointer"
+              >
+                <Settings className="w-3.5 h-3.5" />
+                <span>SETTINGS</span>
+              </button>
+            )}
+
+            {/* Duplicate */}
             <button
               type="button"
-              onClick={() => setIsFibSettingsOpen(true)}
-              title="FIBONACCI SETTINGS (SELECT LEVELS)"
-              aria-label="Fibonacci Retracement Settings"
-              data-testid="fib-settings-btn"
-              className="flex h-7 shrink-0 items-center gap-1 rounded px-2 border border-[#141311]/25 dark:border-[#FFFFFF]/30 bg-[#141311]/8 dark:bg-[#FFFFFF]/12 text-[10.5px] font-bold tracking-wider text-[#141311] dark:text-[#FFFFFF] hover:bg-[#141311]/15 dark:hover:bg-[#FFFFFF]/22 cursor-pointer"
+              onClick={onDuplicate}
+              title="DUPLICATE DRAWING"
+              aria-label="Duplicate drawing"
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[#141311] dark:text-[#FFFFFF] hover:bg-[#141311]/10 dark:hover:bg-[#FFFFFF]/15 cursor-pointer"
             >
-              <Settings className="w-3.5 h-3.5" />
-              <span>SETTINGS</span>
+              <Copy className="w-3.5 h-3.5" />
             </button>
-          )}
+          </div>
 
-          {/* Duplicate & Delete */}
-          <button
-            type="button"
-            onClick={onDuplicate}
-            title="DUPLICATE DRAWING"
-            aria-label="Duplicate drawing"
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[#141311] dark:text-[#FFFFFF] hover:bg-[#141311]/10 dark:hover:bg-[#FFFFFF]/15 cursor-pointer"
-          >
-            <Copy className="w-3.5 h-3.5" />
-          </button>
-          <button
-            type="button"
-            onClick={onDelete}
-            title="DELETE DRAWING (DEL)"
-            aria-label="Delete drawing"
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[#D63946] dark:text-[#E54855] hover:bg-[#E54855]/15 cursor-pointer"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </button>
-          <button
-            type="button"
-            onClick={onClose}
-            title="DESELECT"
-            aria-label="Deselect drawing"
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[#625D52] dark:text-[#9A9892] hover:text-[#141311] dark:hover:text-[#FFFFFF] cursor-pointer"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
+          {/* Pinned extra Delete & Deselect icons — always visible without horizontal side-scrolling */}
+          <div className="flex items-center gap-1 shrink-0 pl-1.5 border-l border-[#141311]/20 dark:border-[#FFFFFF]/25">
+            <button
+              type="button"
+              onClick={onDelete}
+              title="DELETE DRAWING (DEL)"
+              aria-label="Delete drawing"
+              data-testid="drawing-delete-btn"
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-[#E54855]/35 bg-[#E54855]/12 text-[#D63946] dark:text-[#E54855] hover:bg-[#E54855]/25 cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              title="DESELECT"
+              aria-label="Deselect drawing"
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[#625D52] dark:text-[#9A9892] hover:text-[#141311] dark:hover:text-[#FFFFFF] cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
 
         <FibSettingsModal

@@ -33,7 +33,7 @@ import {
 import { loadFibSettingsPreset } from '../modules/drawingStorage';
 import { TOOL_BY_ID } from '../modules/drawingCatalogue';
 import { getInitialChartDpr, PerformanceMonitor } from '../modules/performanceMonitor';
-import { formatPrice, MARKETS } from '../modules/timeframeManager';
+import { formatPrice, isMarketOpen, MARKETS } from '../modules/timeframeManager';
 import {
   ComputedPriceRange,
   computePriceRange,
@@ -1170,14 +1170,26 @@ export const ChartCanvas = React.memo(
       };
     }, [getVisibleCandles, maybeFetchOlder, scheduleViewportCommit, syncCanvasBackingSize]);
 
-    // Live 1-second candle countdown timer tick on right price axis
+    // Live 1-second candle countdown timer tick on right price axis (paused while market is closed)
     useEffect(() => {
       let lastSec = Math.floor(Date.now() / 1000);
+      let wasOpen = isMarketOpen(marketRef.current, Date.now());
       const timer = window.setInterval(() => {
         if (document.hidden || replayRef.current.mode !== 'OFF' || candlesRef.current.length === 0) {
           return;
         }
-        const sec = Math.floor(Date.now() / 1000);
+        const nowMs = Date.now();
+        const openNow = isMarketOpen(marketRef.current, nowMs);
+        if (!openNow) {
+          if (wasOpen) {
+            wasOpen = false;
+            dirtyBaseRef.current = true;
+            scheduleFrameRef.current();
+          }
+          return;
+        }
+        wasOpen = true;
+        const sec = Math.floor(nowMs / 1000);
         if (sec !== lastSec) {
           lastSec = sec;
           dirtyBaseRef.current = true;

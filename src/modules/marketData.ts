@@ -30,6 +30,12 @@ export class MarketDataClient {
 
   public connect(): void {
     if (this.disposed) return;
+    if (
+      this.ws &&
+      (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
     this.cleanupSocket();
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -203,7 +209,9 @@ export interface CachedCandlesEntry {
 
 const CANDLE_CACHE = new Map<string, CachedCandlesEntry>();
 const IN_FLIGHT_KLINES = new Map<string, Promise<{ candles: Candle[]; connectionStatus: ConnectionStatus }>>();
-const MAX_CACHE_ENTRIES = 18;
+const MAX_CACHE_ENTRIES = 6;
+const MAX_CACHED_CANDLES = 500;
+export const MAX_CHART_CANDLES = 1200;
 
 function getCacheKey(market: MarketSymbol, interval: TimeframeId): string {
   return `${market}:${interval}`;
@@ -223,6 +231,10 @@ export function setCachedCandlesEntry(
   connectionStatus: ConnectionStatus
 ): void {
   if (candles.length === 0) return;
+  const trimmed =
+    candles.length > MAX_CACHED_CANDLES
+      ? candles.slice(candles.length - MAX_CACHED_CANDLES)
+      : candles;
   const key = getCacheKey(market, interval);
   // Refresh insertion order for simple LRU eviction
   if (CANDLE_CACHE.has(key)) {
@@ -232,7 +244,7 @@ export function setCachedCandlesEntry(
     if (oldestKey) CANDLE_CACHE.delete(oldestKey);
   }
   CANDLE_CACHE.set(key, {
-    candles,
+    candles: trimmed,
     connectionStatus,
     fetchedAt: Date.now(),
   });
@@ -386,7 +398,7 @@ export async function fetchCandles(params: {
   };
 }
 
-/** Aggressively pre-warm alternate market & popular timeframes in parallel */
+/** Pre-warm only the alternate market's active interval cleanly without spiking Render API requests */
 export function prefetchMarketsAndIntervals(params: {
   activeMarket: MarketSymbol;
   activeInterval: TimeframeId;
@@ -394,44 +406,22 @@ export function prefetchMarketsAndIntervals(params: {
   signal?: AbortSignal;
 }): void {
   const altMarket: MarketSymbol = params.activeMarket === 'XAUUSD' ? 'BTCUSD' : 'XAUUSD';
-  const commonIntervals: TimeframeId[] = ['1m', '5m', '15m', '1h', '4h', '1D'];
+  const existing = getCachedCandlesEntry(altMarket, params.alternateInterval);
+  if (existing && Date.now() - existing.fetchedAt < 30_000) return;
 
-  const targets: Array<{ market: MarketSymbol; interval: TimeframeId }> = [
-    { market: altMarket, interval: params.alternateInterval },
-  ];
-
-  for (const tf of commonIntervals) {
-    if (tf !== params.activeInterval) {
-      targets.push({ market: params.activeMarket, interval: tf });
-    }
-  }
-
-  // Launch priority alternate-market prefetch + staggered timeframe pre-warm without blocking UI
-  const warmTarget = (target: { market: MarketSymbol; interval: TimeframeId }) => {
+  const timer = window.setTimeout(() => {
     if (params.signal?.aborted) return;
-    const existing = getCachedCandlesEntry(target.market, target.interval);
-    if (existing && Date.now() - existing.fetchedAt < 30_000) return;
     void fetchCandles({
-      market: target.market,
-      interval: target.interval,
+      market: altMarket,
+      interval: params.alternateInterval,
       limit: 400,
       signal: params.signal,
     }).catch(() => {
       // Background prefetch failures are silent
     });
-  };
+  }, 250);
 
-  // Batch in parallel (2 at a time) so active chart + WS remain highest priority
-  const firstBatch = targets.slice(0, 2);
-  const restBatch = targets.slice(2);
-  firstBatch.forEach(warmTarget);
-
-  if (restBatch.length > 0) {
-    const timer = window.setTimeout(() => {
-      restBatch.forEach(warmTarget);
-    }, 180);
-    params.signal?.addEventListener('abort', () => clearTimeout(timer), { once: true });
-  }
+  params.signal?.addEventListener('abort', () => clearTimeout(timer), { once: true });
 }
 
 export function deduplicateAndSortCandles(candles: Candle[]): Candle[] {
@@ -487,5 +477,8 @@ export function applyTickToCandles(
     close: price,
     volume,
   });
+  if (candles.length > MAX_CHART_CANDLES) {
+    candles.splice(0, candles.length - MAX_CHART_CANDLES);
+  }
   return { updated: true, newBarAdded: true };
 }

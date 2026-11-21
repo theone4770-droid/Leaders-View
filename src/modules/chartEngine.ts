@@ -8,7 +8,7 @@ import {
   ViewportState,
 } from '../types/chart';
 import { getChartPalette } from './themeManager';
-import { formatAxisTime, formatPrice, getCandleCountdownText, MARKETS } from './timeframeManager';
+import { formatAxisTime, formatPrice, getCandleCountdownText, isMarketOpen, MARKETS } from './timeframeManager';
 import {
   ComputedPriceRange,
   computePriceRange,
@@ -359,7 +359,8 @@ export function renderBaseChart(params: RenderBaseChartParams): BaseRenderMetric
   if (candles.length > 0) {
     const lastCandle = candles[candles.length - 1];
     const effectiveLastClose = liveCandleOverride ? liveCandleOverride.close : lastCandle.close;
-    const showTimer = replay.mode === 'OFF';
+    const nowMs = Date.now();
+    const showTimer = replay.mode === 'OFF' && isMarketOpen(market, nowMs);
     const rawY = priceToY(effectiveLastClose, priceRange, plot);
     const minBadgeY = plot.y + 11;
     const maxBadgeY = Math.max(minBadgeY, plot.y + plot.height - (showTimer ? 26 : 11));
@@ -376,9 +377,9 @@ export function renderBaseChart(params: RenderBaseChartParams): BaseRenderMetric
     ctx.textBaseline = 'middle';
     ctx.fillText(formatPrice(effectiveLastClose, decimals), axisX + 7, lastY - 0.5);
 
-    // Connected live candle countdown timer row directly below price
+    // Connected live candle countdown timer row directly below price (off when market is closed)
     if (showTimer) {
-      const countdown = getCandleCountdownText(Date.now(), interval);
+      const countdown = getCandleCountdownText(nowMs, interval);
       ctx.fillStyle = badgeColor;
       ctx.fillRect(axisX + 1, lastY + 9, PRICE_AXIS_WIDTH - 2, 16);
       ctx.fillStyle = 'rgba(0, 0, 0, 0.22)';
