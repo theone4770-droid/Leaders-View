@@ -1767,10 +1767,10 @@ export function renderDrawingsLayer(params: RenderDrawingsParams): void {
     ctx.fillStyle = palette.crosshairLabelBg;
     ctx.fillRect(axisX + 1, cy - 10, PRICE_AXIS_WIDTH - 2, 20);
     ctx.fillStyle = palette.crosshairLabelText;
-    ctx.font = '600 11px "JetBrains Mono", monospace';
+    ctx.font = '600 10px "JetBrains Mono", monospace';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
-    ctx.fillText(formatPrice(crosshair.price, decimals), axisX + 7, cy);
+    ctx.fillText(formatPrice(crosshair.price, decimals), axisX + 5, cy, PRICE_AXIS_WIDTH - 8);
 
     // 24-hour Time label on bottom axis
     const timeText = formatCrosshairTime(crosshair.time, interval);

@@ -2,7 +2,6 @@ import React from 'react';
 import {
   ChevronDown,
   Crosshair,
-  Download,
   Maximize2,
   Minimize2,
   Moon,
@@ -43,7 +42,6 @@ interface TopToolbarProps {
   onToggleTheme: () => void;
   onRedo: () => void;
   onToggleFullScreen: () => void;
-  onDownloadImage: () => void;
 }
 
 export const TopToolbar: React.FC<TopToolbarProps> = React.memo(({
@@ -67,7 +65,6 @@ export const TopToolbar: React.FC<TopToolbarProps> = React.memo(({
   onToggleTheme,
   onRedo,
   onToggleFullScreen,
-  onDownloadImage,
 }) => {
   const meta = MARKETS[market];
   const price = ticker?.price;
@@ -258,18 +255,6 @@ export const TopToolbar: React.FC<TopToolbarProps> = React.memo(({
           className={`${btnBase} ${btnNormal}`}
         >
           {isFullScreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
-        </button>
-
-        {/* 9. DOWNLOAD CHART IMAGE */}
-        <button
-          type="button"
-          onClick={onDownloadImage}
-          aria-label="Download Chart Image"
-          title="DOWNLOAD CHART IMAGE"
-          data-testid="download-image-btn"
-          className={`${btnBase} ${btnNormal}`}
-        >
-          <Download className="w-4 h-4" />
         </button>
       </div>
     </footer>

@@ -712,9 +712,8 @@ export default function App() {
       market,
       interval: currentInterval,
       theme,
-      lastPrice: tickers[market]?.price,
     });
-  }, [currentInterval, market, theme, tickers]);
+  }, [currentInterval, market, theme]);
 
   const selectedDrawing = useMemo(
     () => currentDrawings.find((d) => d.id === selectedDrawingId) ?? null,
@@ -943,6 +942,7 @@ export default function App() {
           onCancelActiveTool={handleCancelActiveTool}
           onSelectReplayIndex={handleSelectReplayIndex}
           onExitFullScreen={handleToggleFullScreen}
+          onDownloadImage={handleDownloadImage}
           onRequestOlderCandles={handleRequestOlderCandles}
           onRetryLoad={handleRetryLoad}
         />
@@ -1002,7 +1002,6 @@ export default function App() {
         onToggleTheme={handleToggleTheme}
         onRedo={handleRedo}
         onToggleFullScreen={handleToggleFullScreen}
-        onDownloadImage={handleDownloadImage}
       />
 
       {/* MODALS & MENUS */}

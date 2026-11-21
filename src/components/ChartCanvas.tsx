@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
-import { Check, Minimize2, Minus, Plus, RotateCcw, X } from 'lucide-react';
+import { Check, Download, Minus, Plus, RotateCcw, X } from 'lucide-react';
 import {
   Candle,
   CrosshairData,
@@ -103,6 +103,7 @@ interface ChartCanvasProps {
   onCancelActiveTool: () => void;
   onSelectReplayIndex: (index: number) => void;
   onExitFullScreen: () => void;
+  onDownloadImage: () => void;
   onRequestOlderCandles: () => void;
   onRetryLoad?: () => void;
 }
@@ -135,6 +136,7 @@ export const ChartCanvas = React.memo(
         onCancelActiveTool,
         onSelectReplayIndex,
         onExitFullScreen,
+        onDownloadImage,
         onRequestOlderCandles,
         onRetryLoad,
       },
@@ -2805,17 +2807,30 @@ export const ChartCanvas = React.memo(
           </button>
         </div>
 
-        {/* Exit Full Screen Action */}
+        {/* Full Screen Top-Right Controls: Download + Exit (×) */}
         {isFullScreen && (
-          <button
-            type="button"
-            onClick={onExitFullScreen}
-            data-testid="exit-fullscreen-btn"
-            className="fixed top-3 right-3 z-40 flex items-center gap-1.5 rounded-md border border-[#FFFFFF]/55 bg-[#0D0D10]/90 px-3 py-2 text-xs font-bold tracking-[0.12em] text-[#FFFFFF] shadow-xl backdrop-blur-sm hover:bg-[#FFFFFF] hover:text-[#080808] transition-colors cursor-pointer"
-          >
-            <Minimize2 className="w-3.5 h-3.5" />
-            <span>EXIT FULL SCREEN</span>
-          </button>
+          <div className="fixed top-3 right-3 z-40 flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={onDownloadImage}
+              aria-label="Download Chart Image"
+              title="DOWNLOAD CHART IMAGE"
+              data-testid="download-image-btn"
+              className="flex h-8 w-8 items-center justify-center rounded-md border border-[#141311]/35 dark:border-[#FFFFFF]/45 bg-[#FFFFFF]/90 dark:bg-[#0D0D10]/90 text-[#141311] dark:text-[#FFFFFF] shadow-xl backdrop-blur-sm hover:bg-[#141311] hover:text-[#FFFFFF] dark:hover:bg-[#FFFFFF] dark:hover:text-[#080808] transition-colors cursor-pointer"
+            >
+              <Download className="w-4 h-4" />
+            </button>
+            <button
+              type="button"
+              onClick={onExitFullScreen}
+              aria-label="Exit Full Screen"
+              title="EXIT FULL SCREEN"
+              data-testid="exit-fullscreen-btn"
+              className="flex h-8 w-8 items-center justify-center rounded-md border border-[#141311]/35 dark:border-[#FFFFFF]/45 bg-[#FFFFFF]/90 dark:bg-[#0D0D10]/90 text-[#141311] dark:text-[#FFFFFF] shadow-xl backdrop-blur-sm hover:bg-[#141311] hover:text-[#FFFFFF] dark:hover:bg-[#FFFFFF] dark:hover:text-[#080808] transition-colors cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
         )}
 
         {/* Loading Overlay */}

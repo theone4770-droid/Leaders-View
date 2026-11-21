@@ -357,13 +357,14 @@ export function renderBaseChart(params: RenderBaseChartParams): BaseRenderMetric
 
   // Price labels
   ctx.fillStyle = palette.axisText;
-  ctx.font = '500 11px "JetBrains Mono", monospace';
+  ctx.font = '500 10px "JetBrains Mono", monospace';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
+  const labelMaxWidth = PRICE_AXIS_WIDTH - 8;
   for (let p = firstPriceTick, iter = 0; p <= priceRange.max && iter < 240; p += safePriceStep, iter++) {
     const y = priceToY(p, priceRange, plot);
     if (y > plot.y + 10 && y < plot.y + plot.height - 10) {
-      ctx.fillText(formatPrice(p, decimals), axisX + 8, y);
+      ctx.fillText(formatPrice(p, decimals), axisX + 5, y, labelMaxWidth);
     }
   }
 
@@ -384,10 +385,10 @@ export function renderBaseChart(params: RenderBaseChartParams): BaseRenderMetric
     ctx.fillStyle = badgeColor;
     ctx.fillRect(axisX + 1, lastY - 10, PRICE_AXIS_WIDTH - 2, 19);
     ctx.fillStyle = palette.currentPriceText;
-    ctx.font = '600 11px "JetBrains Mono", monospace';
+    ctx.font = '600 10px "JetBrains Mono", monospace';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
-    ctx.fillText(formatPrice(effectiveLastClose, decimals), axisX + 7, lastY - 0.5);
+    ctx.fillText(formatPrice(effectiveLastClose, decimals), axisX + 5, lastY - 0.5, labelMaxWidth);
 
     // Connected live candle countdown timer row directly below price (off when market is closed)
     if (showTimer) {
@@ -397,10 +398,10 @@ export function renderBaseChart(params: RenderBaseChartParams): BaseRenderMetric
       ctx.fillStyle = 'rgba(0, 0, 0, 0.22)';
       ctx.fillRect(axisX + 1, lastY + 9, PRICE_AXIS_WIDTH - 2, 16);
       ctx.fillStyle = palette.currentPriceText;
-      ctx.font = '600 10px "JetBrains Mono", monospace';
+      ctx.font = '600 9.5px "JetBrains Mono", monospace';
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
-      ctx.fillText(countdown, axisX + 7, lastY + 17.5);
+      ctx.fillText(countdown, axisX + 5, lastY + 17.5, labelMaxWidth);
     }
   }
 

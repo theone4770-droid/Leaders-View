@@ -1,7 +1,7 @@
 import { Candle, TimeframeId, ViewportState } from '../types/chart';
 import { getIntervalDurationMs } from './timeframeManager';
 
-export const PRICE_AXIS_WIDTH = 84;
+export const PRICE_AXIS_WIDTH = 64;
 export const TIME_AXIS_HEIGHT = 28;
 export const MIN_BAR_SPACING = 2.2;
 export const MAX_BAR_SPACING = 90;
