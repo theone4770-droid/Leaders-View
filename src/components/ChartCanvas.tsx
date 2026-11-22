@@ -12,7 +12,22 @@ import {
   ViewportState,
   WorldPoint,
 } from '../types/chart';
+import {
+  MarketBidAskQuote,
+  OpenPosition,
+  PendingOrder,
+} from '../types/trading';
 import { renderBaseChart } from '../modules/chartEngine';
+import {
+  computeProjectedSlTpPnL,
+  formatSignedUSD,
+  getReferenceMarketPriceForSlTp,
+  hitTestPositionControls,
+  PositionChartGeometry,
+  PositionDragPreview,
+  PositionHitResult,
+} from '../modules/chartPositionControls';
+import { INSTRUMENT_SPREAD_CONFIG, roundToInstrument } from '../modules/spreadEngine';
 import {
   applyFibSnapToAttachedRectangles,
   constrainRectangleToTrendLine,
@@ -106,6 +121,15 @@ interface ChartCanvasProps {
   onDownloadImage: () => void;
   onRequestOlderCandles: () => void;
   onRetryLoad?: () => void;
+  quote?: MarketBidAskQuote | null;
+  openPositions?: OpenPosition[];
+  pendingOrders?: PendingOrder[];
+  onModifyPositionSlTp?: (params: {
+    positionId: string;
+    sl: number | null;
+    tp: number | null;
+  }) => { ok: boolean; error?: string };
+  hasQuickTradeBar?: boolean;
 }
 
 export const ChartCanvas = React.memo(
@@ -139,6 +163,11 @@ export const ChartCanvas = React.memo(
         onDownloadImage,
         onRequestOlderCandles,
         onRetryLoad,
+        quote = null,
+        openPositions = [],
+        pendingOrders = [],
+        onModifyPositionSlTp,
+        hasQuickTradeBar = false,
       },
       ref
     ) => {
@@ -179,6 +208,10 @@ export const ChartCanvas = React.memo(
     const marketRef = useRef(market);
     const intervalRef = useRef(interval);
     const freeCrosshairRef = useRef(isFreeCrosshair);
+    const quoteRef = useRef<MarketBidAskQuote | null>(quote);
+    const openPositionsRef = useRef<OpenPosition[]>(openPositions);
+    const pendingOrdersRef = useRef<PendingOrder[]>(pendingOrders);
+    const fullScreenRef = useRef<boolean>(isFullScreen);
 
     // Interactive drawing & gesture refs
     const draftRef = useRef<DrawingObject | null>(null);
@@ -188,6 +221,14 @@ export const ChartCanvas = React.memo(
     const laserTrailRef = useRef<LaserTrailPoint[]>([]);
     const replayHoverIdxRef = useRef<number | null>(null);
     const hoveredHitRef = useRef<{ drawingId: string; handleIndex: number } | null>(null);
+    const hoveredPositionHitRef = useRef<PositionHitResult | null>(null);
+    const selectedPositionIdRef = useRef<string | null>(null);
+    const positionDragPreviewRef = useRef<PositionDragPreview | null>(null);
+    const positionGeometriesRef = useRef<PositionChartGeometry[]>([]);
+    const onModifyPositionSlTpRef = useRef(onModifyPositionSlTp);
+    onModifyPositionSlTpRef.current = onModifyPositionSlTp;
+    const [positionFeedback, setPositionFeedback] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+    const positionFeedbackTimerRef = useRef<number | null>(null);
     const longPressTimerRef = useRef<number | null>(null);
 
     // Drag states (declared before syncing drawingsRef so active drags are never overwritten mid-gesture)
@@ -222,6 +263,20 @@ export const ChartCanvas = React.memo(
       | { kind: 'freehand'; drawing: DrawingObject }
       | { kind: 'laser' }
       | { kind: 'dragCreate2pt'; startX: number; startY: number; moved: boolean }
+      | {
+          kind: 'positionEntryPress';
+          positionId: string;
+          startX: number;
+          startY: number;
+          wasAlreadySelected: boolean;
+        }
+      | {
+          kind: 'dragPositionSlTp';
+          positionId: string;
+          target: 'SL' | 'TP';
+          origSl: number | null;
+          origTp: number | null;
+        }
     >({ kind: 'none' });
 
     if (dragModeRef.current.kind !== 'moveDrawing' && dragModeRef.current.kind !== 'resizeHandle') {
@@ -236,6 +291,10 @@ export const ChartCanvas = React.memo(
     marketRef.current = market;
     intervalRef.current = interval;
     freeCrosshairRef.current = isFreeCrosshair;
+    quoteRef.current = quote;
+    openPositionsRef.current = openPositions;
+    pendingOrdersRef.current = pendingOrders;
+    fullScreenRef.current = isFullScreen;
 
     const crosshairRef = useRef<CrosshairData>({
       visible: false,
@@ -589,8 +648,12 @@ export const ChartCanvas = React.memo(
               : 'pointer';
         return;
       }
-      if (mode === 'priceScale') {
+      if (mode === 'priceScale' || mode === 'dragPositionSlTp') {
         canvas.style.cursor = 'ns-resize';
+        return;
+      }
+      if (mode === 'positionEntryPress') {
+        canvas.style.cursor = 'pointer';
         return;
       }
       const tool = TOOL_BY_ID[activeToolRef.current];
@@ -600,6 +663,14 @@ export const ChartCanvas = React.memo(
       }
       if (tool && !tool.isCursorTool) {
         canvas.style.cursor = 'crosshair';
+        return;
+      }
+      if (hoveredPositionHitRef.current) {
+        const pk = hoveredPositionHitRef.current.kind;
+        canvas.style.cursor =
+          pk === 'slHandle' || pk === 'tpHandle' || pk === 'slLine' || pk === 'tpLine'
+            ? 'ns-resize'
+            : 'pointer';
         return;
       }
       if (localX !== undefined && localY !== undefined) {
@@ -719,8 +790,14 @@ export const ChartCanvas = React.memo(
       }
     }, [viewport, requestRedraw]);
 
-    // Mark base+drawing dirty only when underlying market/candle/axis/theme props update
+    // Mark base+drawing dirty only when underlying market/candle/axis/theme/quote props update
     useEffect(() => {
+      if (
+        selectedPositionIdRef.current &&
+        !openPositions.some((p) => p.id === selectedPositionIdRef.current && p.symbol === market)
+      ) {
+        selectedPositionIdRef.current = null;
+      }
       requestRedraw(true, true);
     }, [
       candlesVersion,
@@ -729,6 +806,10 @@ export const ChartCanvas = React.memo(
       theme,
       market,
       interval,
+      quote,
+      openPositions,
+      pendingOrders,
+      isFullScreen,
       requestRedraw,
     ]);
 
@@ -1086,10 +1167,20 @@ export const ChartCanvas = React.memo(
             }
             const bctx = baseCtxRef.current;
             if (bctx) {
+              const baseQ = quoteRef.current;
+              const frameQuote =
+                baseQ && replayRef.current.mode === 'OFF' && liveCandleOverride
+                  ? {
+                      ...baseQ,
+                      bid: liveCandleOverride.close,
+                      ask: liveCandleOverride.close + baseQ.spread,
+                      mid: liveCandleOverride.close + baseQ.spread / 2,
+                    }
+                  : baseQ;
               bctx.save();
               try {
                 bctx.scale(dpr, dpr);
-                renderBaseChart({
+                const baseMetrics = renderBaseChart({
                   ctx: bctx,
                   width,
                   height,
@@ -1103,7 +1194,14 @@ export const ChartCanvas = React.memo(
                   replayHoverIndex: replayHoverIdxRef.current,
                   liveCandleOverride,
                   priceRangeOverride: effectivePriceRange,
+                  quote: frameQuote,
+                  openPositions: openPositionsRef.current,
+                  pendingOrders: pendingOrdersRef.current,
+                  selectedPositionId: selectedPositionIdRef.current,
+                  positionDragPreview: positionDragPreviewRef.current,
+                  isFullScreen: fullScreenRef.current,
                 });
+                positionGeometriesRef.current = baseMetrics.positionGeometries;
               } finally {
                 bctx.restore();
               }
@@ -1204,8 +1302,23 @@ export const ChartCanvas = React.memo(
           clearTimeout(longPressTimerRef.current);
           longPressTimerRef.current = null;
         }
+        if (positionFeedbackTimerRef.current !== null) {
+          clearTimeout(positionFeedbackTimerRef.current);
+          positionFeedbackTimerRef.current = null;
+        }
       };
     }, [candlesRef]);
+
+    const showPositionFeedback = useCallback((kind: 'ok' | 'err', text: string) => {
+      setPositionFeedback({ kind, text });
+      if (positionFeedbackTimerRef.current !== null) {
+        clearTimeout(positionFeedbackTimerRef.current);
+      }
+      positionFeedbackTimerRef.current = window.setTimeout(() => {
+        setPositionFeedback(null);
+        positionFeedbackTimerRef.current = null;
+      }, 2100);
+    }, []);
 
     const updateCrosshair = useCallback(
       (localX: number, localY: number, forceMagnet = false) => {
@@ -1883,7 +1996,97 @@ export const ChartCanvas = React.memo(
         }
       }
 
-      // 6. Cursor mode: Hit-test drawings (handle resize or body move)
+      // 6a. Cursor mode: Hit-test open position lines & SL/TP drag handles first
+      if (replayRef.current.mode === 'OFF') {
+        const posHit = hitTestPositionControls(
+          x,
+          y,
+          positionGeometriesRef.current,
+          plot.x,
+          plot.width
+        );
+        if (posHit) {
+          const targetPos = openPositionsRef.current.find((p) => p.id === posHit.positionId);
+          if (targetPos) {
+            const cfg = INSTRUMENT_SPREAD_CONFIG[targetPos.symbol];
+            const activeRange = getActivePriceRange(vis, plot);
+            const clampedY = Math.max(plot.y, Math.min(plot.y + plot.height, y));
+            const pointerPrice = roundToInstrument(
+              yToPrice(clampedY, activeRange, plot),
+              cfg.decimals
+            );
+
+            if (posHit.kind === 'clearSl' || posHit.kind === 'clearTp') {
+              const res = onModifyPositionSlTpRef.current?.({
+                positionId: targetPos.id,
+                sl: posHit.kind === 'clearSl' ? null : targetPos.sl,
+                tp: posHit.kind === 'clearTp' ? null : targetPos.tp,
+              });
+              if (res && !res.ok) {
+                showPositionFeedback('err', res.error || 'Unable to clear level.');
+              } else {
+                showPositionFeedback(
+                  'ok',
+                  posHit.kind === 'clearSl' ? 'Stop Loss cleared' : 'Take Profit cleared'
+                );
+              }
+              requestRedraw(true, true);
+              return;
+            }
+
+            if (
+              posHit.kind === 'slHandle' ||
+              posHit.kind === 'tpHandle' ||
+              posHit.kind === 'slLine' ||
+              posHit.kind === 'tpLine'
+            ) {
+              const target: 'SL' | 'TP' =
+                posHit.kind === 'slHandle' || posHit.kind === 'slLine' ? 'SL' : 'TP';
+              selectedPositionIdRef.current = targetPos.id;
+              hoveredPositionHitRef.current = posHit;
+              dragModeRef.current = {
+                kind: 'dragPositionSlTp',
+                positionId: targetPos.id,
+                target,
+                origSl: targetPos.sl,
+                origTp: targetPos.tp,
+              };
+              const initPrice =
+                target === 'SL' && posHit.kind === 'slLine' && targetPos.sl !== null
+                  ? targetPos.sl
+                  : target === 'TP' && posHit.kind === 'tpLine' && targetPos.tp !== null
+                    ? targetPos.tp
+                    : pointerPrice;
+              positionDragPreviewRef.current = {
+                positionId: targetPos.id,
+                target,
+                price: initPrice,
+              };
+              syncCanvasCursor(x, y);
+              requestRedraw(true, true);
+              return;
+            }
+
+            if (posHit.kind === 'entry') {
+              const wasAlreadySelected = selectedPositionIdRef.current === targetPos.id;
+              selectedPositionIdRef.current = targetPos.id;
+              hoveredPositionHitRef.current = posHit;
+              dragModeRef.current = {
+                kind: 'positionEntryPress',
+                positionId: targetPos.id,
+                startX: x,
+                startY: y,
+                wasAlreadySelected,
+              };
+              syncCanvasCursor(x, y);
+              requestRedraw(true, true);
+              return;
+            }
+          }
+        }
+      }
+
+      // 6b. Cursor mode: Hit-test drawings (handle resize or body move)
       const hit = hitTestDrawings(
         x,
         y,
@@ -1940,6 +2143,10 @@ export const ChartCanvas = React.memo(
 
       // 8. Otherwise deselect and pan chart smoothly (zero-jump horizontal & vertical drag; touch long-press opens 24h free crosshair)
       hoveredHitRef.current = null;
+      if (selectedPositionIdRef.current !== null) {
+        selectedPositionIdRef.current = null;
+        requestRedraw(true, true);
+      }
       if (selectedIdRef.current) {
         onSelectDrawing(null);
       }
@@ -1995,6 +2202,64 @@ export const ChartCanvas = React.memo(
       if (mode.kind === 'laser') {
         laserTrailRef.current.push({ x, y, createdAt: performance.now() });
         requestRedraw(false, true);
+        return;
+      }
+
+      if (mode.kind === 'positionEntryPress') {
+        if (Math.abs(y - mode.startY) >= 6) {
+          const targetPos = openPositionsRef.current.find((p) => p.id === mode.positionId);
+          if (targetPos) {
+            const cfg = INSTRUMENT_SPREAD_CONFIG[targetPos.symbol];
+            const range = getActivePriceRange(vis, plot);
+            const clampedY = Math.max(plot.y, Math.min(plot.y + plot.height, y));
+            const dragPrice = roundToInstrument(yToPrice(clampedY, range, plot), cfg.decimals);
+            const refPrice = getReferenceMarketPriceForSlTp(targetPos, quoteRef.current);
+            const target: 'SL' | 'TP' =
+              targetPos.direction === 'BUY'
+                ? dragPrice < refPrice
+                  ? 'SL'
+                  : 'TP'
+                : dragPrice > refPrice
+                  ? 'SL'
+                  : 'TP';
+            selectedPositionIdRef.current = targetPos.id;
+            dragModeRef.current = {
+              kind: 'dragPositionSlTp',
+              positionId: targetPos.id,
+              target,
+              origSl: targetPos.sl,
+              origTp: targetPos.tp,
+            };
+            positionDragPreviewRef.current = {
+              positionId: targetPos.id,
+              target,
+              price: dragPrice,
+            };
+            crosshairRef.current.y = clampedY;
+            crosshairRef.current.price = dragPrice;
+            syncCanvasCursor(x, y);
+            requestRedraw(true, true);
+          }
+        }
+        return;
+      }
+
+      if (mode.kind === 'dragPositionSlTp') {
+        const targetPos = openPositionsRef.current.find((p) => p.id === mode.positionId);
+        if (targetPos) {
+          const cfg = INSTRUMENT_SPREAD_CONFIG[targetPos.symbol];
+          const range = getActivePriceRange(vis, plot);
+          const clampedY = Math.max(plot.y, Math.min(plot.y + plot.height, y));
+          const dragPrice = roundToInstrument(yToPrice(clampedY, range, plot), cfg.decimals);
+          positionDragPreviewRef.current = {
+            positionId: mode.positionId,
+            target: mode.target,
+            price: dragPrice,
+          };
+          crosshairRef.current.y = clampedY;
+          crosshairRef.current.price = dragPrice;
+          requestRedraw(true, true);
+        }
         return;
       }
 
@@ -2510,6 +2775,17 @@ export const ChartCanvas = React.memo(
         (!tool || tool.isCursorTool || activeToolRef.current === 'tool_eraser');
 
       if (canHoverDrawings) {
+        if (replayRef.current.mode === 'OFF' && (!tool || tool.isCursorTool)) {
+          hoveredPositionHitRef.current = hitTestPositionControls(
+            x,
+            y,
+            positionGeometriesRef.current,
+            plot.x,
+            plot.width
+          );
+        } else {
+          hoveredPositionHitRef.current = null;
+        }
         const priceRange = computePriceRange(vis, viewportRef.current, plot);
         const hit = hitTestDrawings(
           x,
@@ -2527,9 +2803,12 @@ export const ChartCanvas = React.memo(
           hoveredHitRef.current = hit;
           requestRedraw(false, true);
         }
-      } else if (hoveredHitRef.current !== null) {
-        hoveredHitRef.current = null;
-        requestRedraw(false, true);
+      } else {
+        hoveredPositionHitRef.current = null;
+        if (hoveredHitRef.current !== null) {
+          hoveredHitRef.current = null;
+          requestRedraw(false, true);
+        }
       }
 
       syncCanvasCursor(x, y);
@@ -2569,6 +2848,51 @@ export const ChartCanvas = React.memo(
 
       const mode = dragModeRef.current;
       dragModeRef.current = { kind: 'none' };
+
+      if (mode.kind === 'positionEntryPress') {
+        if (mode.wasAlreadySelected) {
+          selectedPositionIdRef.current = null;
+        } else {
+          selectedPositionIdRef.current = mode.positionId;
+        }
+        if (!freeCrosshairRef.current) {
+          crosshairRef.current.visible = false;
+        }
+        requestRedraw(true, true);
+        syncCanvasCursor();
+        return;
+      }
+
+      if (mode.kind === 'dragPositionSlTp') {
+        const preview = positionDragPreviewRef.current;
+        positionDragPreviewRef.current = null;
+        const targetPos = openPositionsRef.current.find((p) => p.id === mode.positionId);
+        if (preview && targetPos && onModifyPositionSlTpRef.current) {
+          const nextSl = preview.target === 'SL' ? preview.price : targetPos.sl;
+          const nextTp = preview.target === 'TP' ? preview.price : targetPos.tp;
+          const res = onModifyPositionSlTpRef.current({
+            positionId: targetPos.id,
+            sl: nextSl,
+            tp: nextTp,
+          });
+          if (!res.ok) {
+            showPositionFeedback('err', res.error || 'Invalid SL / TP price.');
+          } else {
+            const dec = INSTRUMENT_SPREAD_CONFIG[targetPos.symbol].decimals;
+            const proj = computeProjectedSlTpPnL(targetPos, preview.price);
+            showPositionFeedback(
+              'ok',
+              `${preview.target} ${formatPrice(preview.price, dec)} · ${formatSignedUSD(proj)}`
+            );
+          }
+        }
+        if (!freeCrosshairRef.current) {
+          crosshairRef.current.visible = false;
+        }
+        requestRedraw(true, true);
+        syncCanvasCursor();
+        return;
+      }
 
       if (mode.kind === 'crosshairDrag') {
         if (mode.temporary) {
@@ -2708,9 +3032,13 @@ export const ChartCanvas = React.memo(
           className={`absolute inset-0 block touch-none ${cursorClass}`}
         />
 
-        {/* Active Drawing Tool Banner (with Cancel / Done actions) */}
+        {/* Active Drawing Tool Banner (offset below top-left trading icons & quick trade bar to avoid overlap) */}
         {(isDrawingToolActive || hasActiveDraft || activeToolId === 'tool_eraser' || activeToolId === 'tool_demonstration') && (
-          <div className="absolute top-2.5 left-2.5 z-20 flex items-center gap-2 rounded-md border border-[#141311]/35 dark:border-[#FFFFFF]/45 bg-[#FFFFFF]/96 dark:bg-[#101013]/96 px-2.5 py-1.5 text-[11px] shadow-lg">
+          <div
+            className={`absolute ${
+              hasQuickTradeBar ? 'top-[108px]' : 'top-14'
+            } left-2.5 z-20 flex items-center gap-2 rounded-md border border-[#141311]/35 dark:border-[#FFFFFF]/45 bg-[#FFFFFF]/96 dark:bg-[#101013]/96 px-2.5 py-1.5 text-[11px] shadow-lg`}
+          >
             <span className="font-bold tracking-wider text-[#141311] dark:text-[#FFFFFF]">
               {activeToolDef?.name}
             </span>
@@ -2735,6 +3063,20 @@ export const ChartCanvas = React.memo(
               <X className="w-3 h-3" />
               CANCEL
             </button>
+          </div>
+        )}
+
+        {/* Brief On-Chart SL/TP Drag Feedback Pill */}
+        {positionFeedback && (
+          <div
+            data-testid="chart-position-feedback"
+            className={`pointer-events-none absolute bottom-10 left-2.5 z-20 rounded-md px-2.5 py-1 font-mono-num text-[11px] font-bold shadow-lg ${
+              positionFeedback.kind === 'err'
+                ? 'bg-[#E54855] text-white'
+                : 'bg-[#111218]/95 border border-[#D4AF37]/60 text-white'
+            }`}
+          >
+            {positionFeedback.text}
           </div>
         )}
 

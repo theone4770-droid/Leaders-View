@@ -88,7 +88,31 @@ import { IndicatorsModal } from './components/IndicatorsModal';
 import { AlertsModal } from './components/AlertsModal';
 import { BarReplayControls } from './components/BarReplayControls';
 import { ChartCanvas, ChartCanvasHandle } from './components/ChartCanvas';
+import { TradingTopLeftMenu } from './components/TradingTopLeftMenu';
+import { TradeScreen } from './components/TradeScreen';
+import { PendingOrdersScreen } from './components/PendingOrdersScreen';
+import { HistoryScreen } from './components/HistoryScreen';
+import { OnChartQuickTrade } from './components/OnChartQuickTrade';
 import { usePWAInstall } from './hooks/usePWAInstall';
+import { computeBidAskQuote } from './modules/spreadEngine';
+import {
+  cancelPendingOrder,
+  closeOpenPosition,
+  createPendingOrder,
+  depositOrResetDemoBalance,
+  evaluateMarketTickForTrading,
+  executeMarketOrder,
+  modifyOpenPositionSlTp,
+  modifyPendingOrder,
+} from './modules/tradingEngine';
+import { loadTradingAccountState, saveTradingAccountState } from './modules/tradingStorage';
+import {
+  MarketBidAskQuote,
+  PendingOrderType,
+  TradeDirection,
+  TradingAccountState,
+  TradingScreen,
+} from './types/trading';
 
 interface TriggeredToast {
   id: string;
@@ -199,6 +223,21 @@ export default function App() {
 
   // Bar Replay state
   const [replay, setReplay] = useState<ReplayState>(DEFAULT_REPLAY_STATE);
+
+  // MetaTrader Demo Trading State
+  const [activeTradingScreen, setActiveTradingScreen] = useState<TradingScreen>('NONE');
+  const [quickLotSize, setQuickLotSize] = useState<number>(0.1);
+  const [tradingAccount, setTradingAccount] = useState<TradingAccountState>(() =>
+    loadTradingAccountState()
+  );
+  const tradingAccountRef = useRef(tradingAccount);
+  tradingAccountRef.current = tradingAccount;
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      saveTradingAccountState(tradingAccount);
+    }, 120);
+    return () => clearTimeout(timer);
+  }, [tradingAccount]);
 
   // Menus & Modals
   const [isMarketModalOpen, setIsMarketModalOpen] = useState(false);
@@ -489,6 +528,31 @@ export default function App() {
               { id: `${alert.id}_${Date.now()}`, market: alert.market, price: tick.price, note: alert.note },
               ...prev.slice(0, 3),
             ]);
+          }
+        }
+
+        // Evaluate demo pending orders & open position SL/TP against live/simulated Bid & Ask
+        const liveQuote = computeBidAskQuote(tick.market, tick.price, 'LIVE', tick.timestamp);
+        if (liveQuote && (tradingAccountRef.current.pendingOrders.length > 0 || tradingAccountRef.current.openPositions.length > 0)) {
+          const { nextState, changed, events } = evaluateMarketTickForTrading(
+            tradingAccountRef.current,
+            { [tick.market]: liveQuote },
+            tick.timestamp
+          );
+          if (changed) {
+            tradingAccountRef.current = nextState;
+            setTradingAccount(nextState);
+            for (const ev of events) {
+              setTriggeredToasts((prev) => [
+                {
+                  id: `trd_${tick.timestamp}_${Math.random().toString(36).slice(2, 6)}`,
+                  market: ev.symbol,
+                  price: tick.price,
+                  note: ev.message,
+                },
+                ...prev.slice(0, 3),
+              ]);
+            }
           }
         }
 
@@ -909,12 +973,143 @@ export default function App() {
     setAlerts((prev) => deleteAlert(prev, id));
   }, []);
 
+  const quotes = useMemo<Partial<Record<MarketSymbol, MarketBidAskQuote | null>>>(() => {
+    const activeCandles = candlesRef.current;
+    const activeCandleClose =
+      activeCandles.length > 0 ? activeCandles[activeCandles.length - 1].close : undefined;
+    const xauSpot = tickers.XAUUSD?.price ?? (market === 'XAUUSD' ? activeCandleClose : undefined);
+    const btcSpot = tickers.BTCUSD?.price ?? (market === 'BTCUSD' ? activeCandleClose : undefined);
+    return {
+      XAUUSD: computeBidAskQuote('XAUUSD', xauSpot, connectionStatus),
+      BTCUSD: computeBidAskQuote('BTCUSD', btcSpot, connectionStatus),
+    };
+  }, [tickers, market, candlesVersion, connectionStatus]);
+
+  const quotesRef = useRef(quotes);
+  quotesRef.current = quotes;
+
+  const handleToggleActiveBuySell = useCallback((enabled: boolean) => {
+    setTradingAccount((prev) => ({ ...prev, activeBuySell: enabled }));
+  }, []);
+
+  const handleExecuteMarketOrder = useCallback(
+    (params: {
+      symbol: MarketSymbol;
+      direction: TradeDirection;
+      lotSize: number;
+      sl: number | null;
+      tp: number | null;
+    }) => {
+      const q = quotesRef.current[params.symbol];
+      if (!q) return { ok: false, error: 'Waiting for market quote.' };
+      const res = executeMarketOrder(tradingAccountRef.current, { ...params, quote: q });
+      if (res.ok) {
+        tradingAccountRef.current = res.nextState;
+        setTradingAccount(res.nextState);
+      }
+      return { ok: res.ok, error: res.error };
+    },
+    []
+  );
+
+  const handleClosePosition = useCallback((positionId: string) => {
+    const pos = tradingAccountRef.current.openPositions.find((p) => p.id === positionId);
+    if (!pos) return { ok: false, error: 'Position not found.' };
+    const q = quotesRef.current[pos.symbol];
+    if (!q) return { ok: false, error: 'Waiting for market quote.' };
+    const res = closeOpenPosition(tradingAccountRef.current, { positionId, quote: q, reason: 'MANUAL' });
+    if (res.ok) {
+      tradingAccountRef.current = res.nextState;
+      setTradingAccount(res.nextState);
+    }
+    return { ok: res.ok, error: res.error };
+  }, []);
+
+  const handleModifyPositionSlTp = useCallback(
+    (params: { positionId: string; sl: number | null; tp: number | null }) => {
+      const pos = tradingAccountRef.current.openPositions.find((p) => p.id === params.positionId);
+      const q = pos ? quotesRef.current[pos.symbol] ?? null : null;
+      const res = modifyOpenPositionSlTp(tradingAccountRef.current, { ...params, quote: q });
+      if (res.ok) {
+        tradingAccountRef.current = res.nextState;
+        setTradingAccount(res.nextState);
+      }
+      return { ok: res.ok, error: res.error };
+    },
+    []
+  );
+
+  const handlePlacePendingOrder = useCallback(
+    (params: {
+      symbol: MarketSymbol;
+      orderType: PendingOrderType;
+      lotSize: number;
+      entryPrice: number;
+      limitPrice: number | null;
+      sl: number | null;
+      tp: number | null;
+      expiresAt: number | null;
+    }) => {
+      const q = quotesRef.current[params.symbol];
+      if (!q) return { ok: false, error: 'Waiting for market quote.' };
+      const res = createPendingOrder(tradingAccountRef.current, { ...params, quote: q });
+      if (res.ok) {
+        tradingAccountRef.current = res.nextState;
+        setTradingAccount(res.nextState);
+      }
+      return { ok: res.ok, error: res.error };
+    },
+    []
+  );
+
+  const handleModifyPendingOrder = useCallback(
+    (params: {
+      orderId: string;
+      entryPrice: number;
+      limitPrice: number | null;
+      sl: number | null;
+      tp: number | null;
+    }) => {
+      const ord = tradingAccountRef.current.pendingOrders.find((o) => o.id === params.orderId);
+      const q = ord ? quotesRef.current[ord.symbol] ?? null : null;
+      const res = modifyPendingOrder(tradingAccountRef.current, { ...params, quote: q });
+      if (res.ok) {
+        tradingAccountRef.current = res.nextState;
+        setTradingAccount(res.nextState);
+      }
+      return { ok: res.ok, error: res.error };
+    },
+    []
+  );
+
+  const handleCancelPendingOrder = useCallback((orderId: string) => {
+    const res = cancelPendingOrder(tradingAccountRef.current, orderId);
+    if (res.ok) {
+      tradingAccountRef.current = res.nextState;
+      setTradingAccount(res.nextState);
+    }
+  }, []);
+
+  const handleSetBalance = useCallback((amount: number) => {
+    const next = depositOrResetDemoBalance(tradingAccountRef.current, 'RESET', amount);
+    tradingAccountRef.current = next;
+    setTradingAccount(next);
+  }, []);
+
+  const closeTradingScreen = useCallback(() => setActiveTradingScreen('NONE'), []);
+
   return (
     <div className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-[#FAF8F3] dark:bg-[#080808] text-[#141311] dark:text-[#F5F5F7]">
       {showOpening && <OpeningScreen isReady={!isLoadingCandles} onComplete={handleOpeningComplete} />}
 
       {/* MAIN CHART VIEWPORT (Chart-First, Bottom Navigation Bar) */}
       <main className="relative flex-1 min-h-0 w-full overflow-hidden">
+        {/* Top-Left Exact Three White MetaTrader Menu Icons */}
+        <TradingTopLeftMenu
+          activeScreen={activeTradingScreen}
+          onSelectScreen={setActiveTradingScreen}
+        />
+
         <ChartCanvas
           ref={chartRef}
           market={market}
@@ -945,6 +1140,29 @@ export default function App() {
           onDownloadImage={handleDownloadImage}
           onRequestOlderCandles={handleRequestOlderCandles}
           onRetryLoad={handleRetryLoad}
+          quote={quotes[market] ?? null}
+          openPositions={tradingAccount.openPositions}
+          pendingOrders={tradingAccount.pendingOrders}
+          onModifyPositionSlTp={handleModifyPositionSlTp}
+          hasQuickTradeBar={
+            tradingAccount.activeBuySell &&
+            activeTradingScreen === 'NONE' &&
+            replay.mode === 'OFF'
+          }
+        />
+
+        {/* On-Chart MT5 One-Click SELL / Lot +/- / BUY Panel (when Active BUY/SELL is ON) */}
+        <OnChartQuickTrade
+          visible={
+            tradingAccount.activeBuySell &&
+            activeTradingScreen === 'NONE' &&
+            replay.mode === 'OFF'
+          }
+          market={market}
+          quote={quotes[market] ?? null}
+          lotSize={quickLotSize}
+          onChangeLotSize={setQuickLotSize}
+          onExecuteQuickOrder={handleExecuteMarketOrder}
         />
 
         {/* Floating Draggable Favorites Toolbar on Right Side of Chart */}
@@ -1062,6 +1280,38 @@ export default function App() {
         onUpdateAlert={handleUpdateAlert}
         onDeleteAlert={handleDeleteAlert}
         onClose={handleCloseAlerts}
+      />
+
+      {/* MetaTrader Trading Interface Screens */}
+      <TradeScreen
+        open={activeTradingScreen === 'TRADE'}
+        account={tradingAccount}
+        selectedMarket={market}
+        quotes={quotes}
+        onToggleActiveBuySell={handleToggleActiveBuySell}
+        onExecuteOrder={handleExecuteMarketOrder}
+        onClosePosition={handleClosePosition}
+        onModifyPositionSlTp={handleModifyPositionSlTp}
+        onSetBalance={handleSetBalance}
+        onSwitchScreen={setActiveTradingScreen}
+        onClose={closeTradingScreen}
+      />
+
+      <PendingOrdersScreen
+        open={activeTradingScreen === 'PENDING'}
+        account={tradingAccount}
+        selectedMarket={market}
+        quotes={quotes}
+        onPlacePendingOrder={handlePlacePendingOrder}
+        onModifyPendingOrder={handleModifyPendingOrder}
+        onCancelPendingOrder={handleCancelPendingOrder}
+        onClose={closeTradingScreen}
+      />
+
+      <HistoryScreen
+        open={activeTradingScreen === 'HISTORY'}
+        account={tradingAccount}
+        onClose={closeTradingScreen}
       />
 
       {/* Triggered Price Alert Notification Toasts */}

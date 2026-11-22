@@ -2306,8 +2306,14 @@ async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
+    const hmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        hmr: hmrDisabled ? false : { server },
+        ws: { server },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
