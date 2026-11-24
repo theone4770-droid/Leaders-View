@@ -102,8 +102,9 @@ async function fetchSingleMirror<T>(base: string, endpointPath: string, timeoutM
       headers: { Accept: 'application/json' },
     });
     if (!res.ok) {
-      if ((res.status === 418 || res.status === 451 || res.status === 403 || res.status === 429) && base !== 'https://data-api.binance.vision') {
-        binanceHostBlockedUntil.set(base, Date.now() + 10 * 60_000);
+      if (res.status === 418 || res.status === 451 || res.status === 403 || res.status === 429) {
+        const cooldownMs = base === 'https://data-api.binance.vision' ? 90_000 : 10 * 60_000;
+        binanceHostBlockedUntil.set(base, Date.now() + cooldownMs);
       }
       throw new Error(`HTTP ${res.status} from ${base}`);
     }
@@ -146,25 +147,20 @@ async function fetchBinanceFuturesJson<T>(endpointPath: string): Promise<T> {
 }
 
 async function fetchBinanceJson<T>(endpointPath: string): Promise<T> {
-  // Always prioritize Binance's cloud-safe market data CDN first (immune to 418/451 IP blocks)
-  try {
-    const cdn = await fetchSingleMirror<T>('https://data-api.binance.vision', endpointPath, 4200);
-    return cdn.data;
-  } catch (cdnErr) {
-    const now = Date.now();
-    let lastError: unknown = cdnErr;
-    for (const base of BINANCE_REST_BASES) {
-      if (base === 'https://data-api.binance.vision') continue;
-      if ((binanceHostBlockedUntil.get(base) || 0) > now) continue;
-      try {
-        const res = await fetchSingleMirror<T>(base, endpointPath, 2800);
-        return res.data;
-      } catch (err) {
-        lastError = err;
-      }
+  const now = Date.now();
+  let lastError: unknown;
+  // Prioritize data-api.binance.vision first unless temporarily in 418/429 cooldown
+  for (const base of BINANCE_REST_BASES) {
+    if ((binanceHostBlockedUntil.get(base) || 0) > now) continue;
+    const timeoutMs = base === 'https://data-api.binance.vision' ? 3600 : 2500;
+    try {
+      const res = await fetchSingleMirror<T>(base, endpointPath, timeoutMs);
+      return res.data;
+    } catch (err) {
+      lastError = err;
     }
-    throw lastError ?? new Error('Unable to reach market data provider');
   }
+  throw lastError ?? new Error('Market data mirror temporarily rate-limited');
 }
 
 function parseBinanceKlines(raw: unknown[][]): Candle[] {
@@ -602,7 +598,7 @@ async function fetchCoinbaseBtcSubMinuteCandles(
     if (cb1m && cb1m.length > 0) {
       const subPerMin = Math.max(1, Math.round(60_000 / bucketMs));
       const expanded: Candle[] = [];
-      const cutoff = dense.length > 0 ? dense[0].time : Number.MAX_SAFE_INTEGER;
+      const cutoff = dense.length > 0 ? dense[0].time : (endTime ? endTime + 1 : Number.MAX_SAFE_INTEGER);
       for (const m of cb1m) {
         const stepDelta = (m.close - m.open) / subPerMin;
         for (let s = 0; s < subPerMin; s++) {
@@ -1023,6 +1019,226 @@ async function fetchTwelveDataXauCandles(
   }
 }
 
+const MAX_LIVE_1S_BARS = 3600;
+const live1sCandles: Record<MarketSymbol, Map<number, Candle>> = {
+  XAUUSD: new Map(),
+  BTCUSD: new Map(),
+};
+
+function recordLive1sTick(market: MarketSymbol, price: number, volume: number, timestampMs: number): void {
+  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(timestampMs)) return;
+  const bucketTime = Math.floor(timestampMs / 1000) * 1000;
+  const map = live1sCandles[market];
+  const existing = map.get(bucketTime);
+  if (!existing) {
+    let prevClose = price;
+    for (const c of map.values()) {
+      prevClose = c.close;
+    }
+    map.set(bucketTime, {
+      time: bucketTime,
+      open: prevClose,
+      high: Math.max(prevClose, price),
+      low: Math.min(prevClose, price),
+      close: price,
+      volume: Number.isFinite(volume) ? volume : 0,
+    });
+    if (map.size > MAX_LIVE_1S_BARS) {
+      const oldest = map.keys().next().value;
+      if (oldest !== undefined) map.delete(oldest);
+    }
+  } else {
+    if (price > existing.high) existing.high = price;
+    if (price < existing.low) existing.low = price;
+    existing.close = price;
+    if (Number.isFinite(volume) && volume > 0) existing.volume += volume;
+  }
+}
+
+function getLive1sAggregated(market: MarketSymbol, bucketMs: number, endTime?: number): Candle[] {
+  const map = live1sCandles[market];
+  if (map.size === 0) return [];
+  const raw = Array.from(map.values())
+    .filter((c) => !endTime || c.time <= endTime)
+    .sort((a, b) => a.time - b.time);
+  if (raw.length === 0) return [];
+  if (bucketMs === 1000) {
+    // Fill short gaps seamlessly up to latest bar
+    const filled: Candle[] = [];
+    const startT = raw[0].time;
+    const endT = raw[raw.length - 1].time;
+    const byT = new Map<number, Candle>();
+    for (const c of raw) byT.set(c.time, c);
+    let prevClose = raw[0].open;
+    for (let t = startT; t <= endT; t += 1000) {
+      const hit = byT.get(t);
+      if (hit) {
+        filled.push({
+          time: t,
+          open: prevClose,
+          high: Math.max(prevClose, hit.high),
+          low: Math.min(prevClose, hit.low),
+          close: hit.close,
+          volume: hit.volume,
+        });
+        prevClose = hit.close;
+      } else {
+        filled.push({ time: t, open: prevClose, high: prevClose, low: prevClose, close: prevClose, volume: 0 });
+      }
+    }
+    return filled;
+  }
+  return aggregateCandlesByMs(raw, bucketMs);
+}
+
+function buildDenseSubMinuteFromTrades(
+  trades: Array<{ timeMs: number; price: number; volume: number }>,
+  bucketMs: number
+): Candle[] {
+  const buckets = new Map<number, Candle>();
+  for (const t of trades) {
+    if (!Number.isFinite(t.price) || !Number.isFinite(t.timeMs) || t.price <= 0) continue;
+    const bTime = Math.floor(t.timeMs / bucketMs) * bucketMs;
+    const ex = buckets.get(bTime);
+    if (!ex) {
+      buckets.set(bTime, {
+        time: bTime,
+        open: t.price,
+        high: t.price,
+        low: t.price,
+        close: t.price,
+        volume: Number.isFinite(t.volume) ? t.volume : 0,
+      });
+    } else {
+      if (t.price > ex.high) ex.high = t.price;
+      if (t.price < ex.low) ex.low = t.price;
+      ex.close = t.price;
+      ex.volume += Number.isFinite(t.volume) ? t.volume : 0;
+    }
+  }
+  const sortedTimes = Array.from(buckets.keys()).sort((a, b) => a - b);
+  if (sortedTimes.length === 0) return [];
+  const startB = sortedTimes[0];
+  const endB = sortedTimes[sortedTimes.length - 1];
+  const dense: Candle[] = [];
+  let prevClose = buckets.get(startB)!.open;
+  for (let t = startB; t <= endB; t += bucketMs) {
+    const existing = buckets.get(t);
+    if (existing) {
+      const cOpen = prevClose;
+      dense.push({
+        time: t,
+        open: cOpen,
+        high: Math.max(cOpen, existing.high),
+        low: Math.min(cOpen, existing.low),
+        close: existing.close,
+        volume: existing.volume,
+      });
+      prevClose = existing.close;
+    } else {
+      dense.push({
+        time: t,
+        open: prevClose,
+        high: prevClose,
+        low: prevClose,
+        close: prevClose,
+        volume: 0,
+      });
+    }
+  }
+  return dense;
+}
+
+function expand1mCandlesToSubMinute(bars1m: Candle[], bucketMs: number, cutoffMs: number): Candle[] {
+  if (bars1m.length === 0) return [];
+  const subPerMin = Math.max(1, Math.round(60_000 / bucketMs));
+  const expanded: Candle[] = [];
+  for (const m of bars1m) {
+    const stepDelta = (m.close - m.open) / subPerMin;
+    for (let s = 0; s < subPerMin; s++) {
+      const t = m.time + s * bucketMs;
+      if (t >= cutoffMs) break;
+      const o = s === 0 ? m.open : m.open + stepDelta * s;
+      const c = s === subPerMin - 1 ? m.close : m.open + stepDelta * (s + 1);
+      const h = s === 0 ? Math.max(o, c, m.high) : Math.max(o, c);
+      const l = s === subPerMin - 1 ? Math.min(o, c, m.low) : Math.min(o, c);
+      expanded.push({
+        time: t,
+        open: roundPrice(o),
+        high: roundPrice(h),
+        low: roundPrice(l),
+        close: roundPrice(c),
+        volume: m.volume / subPerMin,
+      });
+    }
+  }
+  return expanded;
+}
+
+async function fetchOkxTrades(instId: 'XAU-USDT-SWAP' | 'BTC-USDT'): Promise<Array<{ timeMs: number; price: number; volume: number }>> {
+  if (Date.now() < okxBlockedUntil) return [];
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2400);
+  try {
+    const res = await fetch(`https://www.okx.com/api/v5/market/trades?instId=${instId}&limit=500`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json', 'User-Agent': 'LeadersView/1.0' },
+    });
+    if (!res.ok) return [];
+    const body = (await res.json()) as {
+      code?: string;
+      data?: Array<{ px?: string; sz?: string; ts?: string }>;
+    };
+    if (body.code !== '0' || !Array.isArray(body.data)) return [];
+    const out: Array<{ timeMs: number; price: number; volume: number }> = [];
+    for (let i = body.data.length - 1; i >= 0; i--) {
+      const row = body.data[i];
+      const price = Number(row.px);
+      const volume = Number(row.sz) || 0;
+      const timeMs = Number(row.ts);
+      if (Number.isFinite(price) && price > 0 && Number.isFinite(timeMs)) {
+        out.push({ timeMs, price, volume });
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchKrakenTrades(pair: 'PAXGUSD' | 'XBTUSD'): Promise<Array<{ timeMs: number; price: number; volume: number }>> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2600);
+  try {
+    const res = await fetch(`https://api.kraken.com/0/public/Trades?pair=${pair}&count=500`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json', 'User-Agent': 'LeadersView/1.0' },
+    });
+    if (!res.ok) return [];
+    const body = (await res.json()) as { result?: Record<string, unknown> };
+    const entries = body.result ? Object.entries(body.result) : [];
+    const series = entries.find(([k, v]) => k !== 'last' && Array.isArray(v));
+    const rows = series?.[1];
+    if (!Array.isArray(rows)) return [];
+    const out: Array<{ timeMs: number; price: number; volume: number }> = [];
+    for (const r of rows as Array<Array<string | number>>) {
+      const price = Number(r[0]);
+      const volume = Number(r[1]) || 0;
+      const timeMs = Math.floor(Number(r[2]) * 1000);
+      if (Number.isFinite(price) && price > 0 && Number.isFinite(timeMs)) {
+        out.push({ timeMs, price, volume });
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function fetchXauSubMinuteCandles(
   interval: string,
   limit = 350,
@@ -1033,138 +1249,176 @@ async function fetchXauSubMinuteCandles(
   const bucketMs = spec.bucketMs || spec.durationMs;
   const clampedLimit = Math.max(20, Math.min(1000, limit));
 
-  try {
-    // Build dense continuous sub-minute bars from live XAUUSDT Futures aggTrades for recent window
-    const maxPages = interval === '1s' ? 3 : 2;
-    let allTrades: Array<{ a: number; p: string; q: string; T: number }> = [];
-    let fromId: number | undefined;
-    const qsBase = endTime && Number.isFinite(endTime)
-      ? `&endTime=${Math.floor(endTime)}`
-      : '';
+  // 1. Primary Binance Futures XAUUSDT aggTrades + 1m expansion (when not geo-blocked)
+  if (Date.now() >= fapiFuturesBlockedUntil) {
+    try {
+      const maxPages = interval === '1s' ? 2 : 1;
+      let allTrades: Array<{ a: number; p: string; q: string; T: number }> = [];
+      let fromId: number | undefined;
 
-    if (!endTime) {
-      for (let p = 0; p < maxPages; p++) {
-        const qs = fromId
-          ? `symbol=XAUUSDT&limit=1000&fromId=${fromId}`
-          : `symbol=XAUUSDT&limit=1000${qsBase}`;
-        const batch = await fetchBinanceFuturesJson<Array<{ a: number; p: string; q: string; T: number }>>(
-          `/fapi/v1/aggTrades?${qs}`
-        );
-        if (!Array.isArray(batch) || batch.length === 0) break;
-        allTrades = [...batch, ...allTrades];
-        const firstId = batch[0].a;
-        if (firstId <= 1 || batch.length < 1000) break;
-        fromId = Math.max(1, firstId - 1000);
-      }
-    }
-
-    const buckets = new Map<number, Candle>();
-    for (const t of allTrades) {
-      const price = Number(t.p);
-      const qty = Number(t.q);
-      const ts = Number(t.T);
-      if (!Number.isFinite(price) || !Number.isFinite(ts) || price <= 0) continue;
-      const bTime = Math.floor(ts / bucketMs) * bucketMs;
-      const ex = buckets.get(bTime);
-      if (!ex) {
-        buckets.set(bTime, {
-          time: bTime,
-          open: price,
-          high: price,
-          low: price,
-          close: price,
-          volume: Number.isFinite(qty) ? qty : 0,
-        });
-      } else {
-        if (price > ex.high) ex.high = price;
-        if (price < ex.low) ex.low = price;
-        ex.close = price;
-        ex.volume += Number.isFinite(qty) ? qty : 0;
-      }
-    }
-
-    let dense: Candle[] = [];
-    const sortedTimes = Array.from(buckets.keys()).sort((a, b) => a - b);
-    if (sortedTimes.length > 0) {
-      const startB = sortedTimes[0];
-      const endB = sortedTimes[sortedTimes.length - 1];
-      let prevClose = buckets.get(startB)!.open;
-      for (let t = startB; t <= endB; t += bucketMs) {
-        const existing = buckets.get(t);
-        if (existing) {
-          const cOpen = prevClose;
-          dense.push({
-            time: t,
-            open: cOpen,
-            high: Math.max(cOpen, existing.high),
-            low: Math.min(cOpen, existing.low),
-            close: existing.close,
-            volume: existing.volume,
-          });
-          prevClose = existing.close;
-        } else {
-          dense.push({
-            time: t,
-            open: prevClose,
-            high: prevClose,
-            low: prevClose,
-            close: prevClose,
-            volume: 0,
-          });
+      if (!endTime) {
+        for (let p = 0; p < maxPages; p++) {
+          const qs = fromId
+            ? `symbol=XAUUSDT&limit=1000&fromId=${fromId}`
+            : `symbol=XAUUSDT&limit=1000`;
+          const batch = await fetchBinanceFuturesJson<Array<{ a: number; p: string; q: string; T: number }>>(
+            `/fapi/v1/aggTrades?${qs}`
+          );
+          if (!Array.isArray(batch) || batch.length === 0) break;
+          allTrades = [...batch, ...allTrades];
+          const firstId = batch[0].a;
+          if (firstId <= 1 || batch.length < 1000) break;
+          fromId = Math.max(1, firstId - 1000);
         }
       }
-    }
 
+      let dense = buildDenseSubMinuteFromTrades(
+        allTrades.map((t) => ({ timeMs: Number(t.T), price: Number(t.p), volume: Number(t.q) || 0 })),
+        bucketMs
+      );
+
+      if (dense.length < clampedLimit) {
+        const neededBars = clampedLimit - dense.length;
+        const neededMinutes = Math.min(1000, Math.ceil((neededBars * bucketMs) / 60_000) + 5);
+        const beforeMs = dense.length > 0 ? dense[0].time - 1 : endTime;
+        const qs = new URLSearchParams({
+          symbol: 'XAUUSDT',
+          interval: '1m',
+          limit: String(Math.max(20, neededMinutes)),
+        });
+        if (beforeMs && Number.isFinite(beforeMs)) {
+          qs.set('endTime', String(Math.floor(beforeMs)));
+        }
+        const raw1m = await fetchBinanceFuturesJson<unknown[][]>(`/fapi/v1/klines?${qs.toString()}`);
+        const parsed1m = parseBinanceKlines(raw1m);
+        const cutoff = dense.length > 0 ? dense[0].time : (endTime ? endTime + 1 : Number.MAX_SAFE_INTEGER);
+        const expanded = expand1mCandlesToSubMinute(parsed1m, bucketMs, cutoff);
+        dense = [...expanded, ...dense];
+      }
+
+      if (dense.length > clampedLimit) {
+        dense = dense.slice(dense.length - clampedLimit);
+      }
+      if (dense.length >= 20) {
+        return { candles: dense, source: 'xauusdt' };
+      }
+    } catch {
+      // Fall through cleanly to OKX / Binance Data CDN / Kraken
+    }
+  }
+
+  // 2. Cloud-safe OKX XAU-USDT-SWAP perpetual trades + 1m expansion (works reliably across 1s..45s on Cloud Run)
+  if (Date.now() >= okxBlockedUntil) {
+    try {
+      let dense: Candle[] = [];
+      if (!endTime) {
+        const trades = await fetchOkxTrades('XAU-USDT-SWAP');
+        dense = buildDenseSubMinuteFromTrades(trades, bucketMs);
+      }
+      if (dense.length < clampedLimit) {
+        const neededBars = clampedLimit - dense.length;
+        const neededMinutes = Math.min(350, Math.ceil((neededBars * bucketMs) / 60_000) + 5);
+        const beforeMs = dense.length > 0 ? dense[0].time - 1 : endTime;
+        const okx1m = await fetchOkxCandles('XAU-USDT-SWAP', '1m', Math.max(20, neededMinutes), beforeMs);
+        if (okx1m && okx1m.length > 0) {
+          const cutoff = dense.length > 0 ? dense[0].time : (endTime ? endTime + 1 : Number.MAX_SAFE_INTEGER);
+          const expanded = expand1mCandlesToSubMinute(okx1m, bucketMs, cutoff);
+          dense = [...expanded, ...dense];
+        }
+      }
+      if (dense.length > clampedLimit) {
+        dense = dense.slice(dense.length - clampedLimit);
+      }
+      if (dense.length >= 20) {
+        return { candles: dense, source: 'okx_xau' };
+      }
+    } catch {
+      // Fall through to Binance PAXGUSDT / Kraken
+    }
+  }
+
+  // 3. Binance Spot PAXGUSDT (1s head + 1m backfill, wrapped so HTTP 418 never crashes)
+  try {
+    let dense: Candle[] = [];
+    if (interval === '1s' || interval === '5s') {
+      const qs = new URLSearchParams({
+        symbol: 'PAXGUSDT',
+        interval: '1s',
+        limit: String(Math.min(1000, clampedLimit * Math.max(1, Math.round(bucketMs / 1000)))),
+      });
+      if (endTime && Number.isFinite(endTime)) {
+        qs.set('endTime', String(Math.floor(endTime)));
+      }
+      const raw1s = await fetchBinanceJson<unknown[][]>(`/api/v3/klines?${qs.toString()}`);
+      const parsed1s = parseBinanceKlines(raw1s);
+      dense = bucketMs > 1000 ? aggregateCandlesByMs(parsed1s, bucketMs) : parsed1s;
+    }
     if (dense.length < clampedLimit) {
       const neededBars = clampedLimit - dense.length;
-      const neededMinutes = Math.min(1000, Math.ceil((neededBars * bucketMs) / 60_000) + 5);
+      const neededMinutes = Math.min(350, Math.ceil((neededBars * bucketMs) / 60_000) + 5);
       const beforeMs = dense.length > 0 ? dense[0].time - 1 : endTime;
-      const qs = new URLSearchParams({
-        symbol: 'XAUUSDT',
+      const qs1m = new URLSearchParams({
+        symbol: 'PAXGUSDT',
         interval: '1m',
         limit: String(Math.max(20, neededMinutes)),
       });
       if (beforeMs && Number.isFinite(beforeMs)) {
-        qs.set('endTime', String(Math.floor(beforeMs)));
+        qs1m.set('endTime', String(Math.floor(beforeMs)));
       }
-      const raw1m = await fetchBinanceFuturesJson<unknown[][]>(`/fapi/v1/klines?${qs.toString()}`);
+      const raw1m = await fetchBinanceJson<unknown[][]>(`/api/v3/klines?${qs1m.toString()}`);
       const parsed1m = parseBinanceKlines(raw1m);
-      const subPerMin = Math.max(1, Math.round(60_000 / bucketMs));
-      const expanded: Candle[] = [];
-      for (const m of parsed1m) {
-        const stepDelta = (m.close - m.open) / subPerMin;
-        for (let s = 0; s < subPerMin; s++) {
-          const t = m.time + s * bucketMs;
-          if (dense.length > 0 && t >= dense[0].time) break;
-          const o = s === 0 ? m.open : m.open + stepDelta * s;
-          const c = s === subPerMin - 1 ? m.close : m.open + stepDelta * (s + 1);
-          const h = s === 0 ? Math.max(o, c, m.high) : Math.max(o, c);
-          const l = s === subPerMin - 1 ? Math.min(o, c, m.low) : Math.min(o, c);
-          expanded.push({
-            time: t,
-            open: roundPrice(o),
-            high: roundPrice(h),
-            low: roundPrice(l),
-            close: roundPrice(c),
-            volume: m.volume / subPerMin,
-          });
-        }
-      }
+      const cutoff = dense.length > 0 ? dense[0].time : (endTime ? endTime + 1 : Number.MAX_SAFE_INTEGER);
+      const expanded = expand1mCandlesToSubMinute(parsed1m, bucketMs, cutoff);
       dense = [...expanded, ...dense];
     }
+    if (dense.length > clampedLimit) {
+      dense = dense.slice(dense.length - clampedLimit);
+    }
+    if (dense.length >= 20) {
+      return { candles: dense, source: 'paxgusdt' };
+    }
+  } catch {
+    // Binance rate-limited / 418 -> fall through cleanly to Kraken
+  }
 
+  // 4. US-regulated Kraken PAXG/USD trades + 1m expansion
+  try {
+    let dense: Candle[] = [];
+    if (!endTime) {
+      const trades = await fetchKrakenTrades('PAXGUSD');
+      dense = buildDenseSubMinuteFromTrades(trades, bucketMs);
+    }
+    if (dense.length < clampedLimit) {
+      const neededBars = clampedLimit - dense.length;
+      const neededMinutes = Math.min(720, Math.ceil((neededBars * bucketMs) / 60_000) + 5);
+      const beforeMs = dense.length > 0 ? dense[0].time - 1 : endTime;
+      const kraken1m = await fetchKrakenCandles('PAXGUSD', '1m', Math.max(20, neededMinutes), beforeMs);
+      if (kraken1m && kraken1m.length > 0) {
+        const cutoff = dense.length > 0 ? dense[0].time : (endTime ? endTime + 1 : Number.MAX_SAFE_INTEGER);
+        const expanded = expand1mCandlesToSubMinute(kraken1m, bucketMs, cutoff);
+        dense = [...expanded, ...dense];
+      }
+    }
     if (dense.length > clampedLimit) {
       dense = dense.slice(dense.length - clampedLimit);
     }
     if (dense.length > 0) {
-      return { candles: dense, source: 'xauusdt' };
+      return { candles: dense, source: 'kraken_paxg' };
     }
   } catch {
-    // Fall through cleanly to cloud-safe Binance Public Data CDN PAXGUSDT 1s klines
+    // Fall through to live 1s buffer
   }
 
-  const paxgSub = await fetchBinanceSpotPaxgCandles(interval, clampedLimit, endTime);
-  return { candles: paxgSub, source: 'paxgusdt' };
+  // 5. Final resilience fallback: server's in-memory recorded live 1s ticks
+  const liveFallback = getLive1sAggregated('XAUUSD', bucketMs, endTime);
+  if (liveFallback.length > 0) {
+    return {
+      candles: liveFallback.length > clampedLimit ? liveFallback.slice(-clampedLimit) : liveFallback,
+      source: 'spot_live',
+    };
+  }
+
+  return { candles: [], source: 'xauusdt' };
 }
 
 async function fetchHistoricalCandles(
@@ -1202,6 +1456,7 @@ async function fetchHistoricalCandles(
   const clampedLimit = Math.max(20, Math.min(1000, limit));
   let result: Candle[] = [];
   let xauSource = 'xauusdt';
+  let btcSource: 'binance_usdt' | 'coinbase_usd' | 'okx_usdt' | 'kraken_usd' | 'spot_live' = 'binance_usdt';
 
   if (market === 'XAUUSD' && spec.native === '1s') {
     const sub = await fetchXauSubMinuteCandles(interval, clampedLimit, endTime);
@@ -1301,67 +1556,118 @@ async function fetchHistoricalCandles(
       ? Math.max(1, Math.round(spec.bucketMs / (INTERVAL_MAP[spec.native]?.durationMs || 1000)))
       : spec.monthFactor || 1;
 
-    try {
-      const totalNeeded = Math.min(3000, clampedLimit * multiplier + multiplier);
-      const pagesNeeded = Math.min(3, Math.ceil(totalNeeded / 1000));
-      let allBase: Candle[] = [];
-      let cursorEnd = endTime;
-
-      for (let p = 0; p < pagesNeeded; p++) {
-        const reqLimit = Math.min(1000, totalNeeded - allBase.length);
-        if (reqLimit <= 0) break;
-        const params = new URLSearchParams({
-          symbol: cfg.providerSymbol,
-          interval: spec.native,
-          limit: String(reqLimit),
-        });
-        if (cursorEnd && Number.isFinite(cursorEnd)) {
-          params.set('endTime', String(Math.floor(cursorEnd)));
+    if (spec.native === '1s') {
+      const bucketMs = spec.bucketMs || spec.durationMs;
+      // Avoid 3-page 1s bursts on Binance (prevents HTTP 418 bans); use Coinbase USD directly when non-1s or if Binance is cooled down
+      if (interval === '1s') {
+        try {
+          const qs = new URLSearchParams({
+            symbol: cfg.providerSymbol,
+            interval: '1s',
+            limit: String(Math.min(1000, clampedLimit)),
+          });
+          if (endTime && Number.isFinite(endTime)) {
+            qs.set('endTime', String(Math.floor(endTime)));
+          }
+          const raw = await fetchBinanceJson<unknown[][]>(`/api/v3/klines?${qs.toString()}`);
+          result = parseBinanceKlines(raw);
+          btcSource = 'binance_usdt';
+        } catch {
+          // Fall through to Coinbase / OKX / Kraken
         }
-        if (startTime && Number.isFinite(startTime) && pagesNeeded === 1) {
-          params.set('startTime', String(Math.floor(startTime)));
+      }
+      if (result.length === 0) {
+        const cbSub = await fetchCoinbaseBtcSubMinuteCandles(interval, clampedLimit, endTime);
+        if (cbSub.length > 0) {
+          result = cbSub;
+          btcSource = 'coinbase_usd';
         }
-        const raw = await fetchBinanceJson<unknown[][]>(`/api/v3/klines?${params.toString()}`);
-        const parsed = parseBinanceKlines(raw);
-        if (parsed.length === 0) break;
-        allBase = [...parsed, ...allBase];
-        cursorEnd = parsed[0].time - 1;
-        if (parsed.length < reqLimit) break;
+      }
+      if (result.length === 0) {
+        const okx1m = await fetchOkxCandles('BTC-USDT', '1m', Math.min(350, Math.ceil((clampedLimit * bucketMs) / 60_000) + 5), endTime);
+        if (okx1m && okx1m.length > 0) {
+          const expanded = expand1mCandlesToSubMinute(okx1m, bucketMs, endTime ? endTime + 1 : Number.MAX_SAFE_INTEGER);
+          result = expanded.length > clampedLimit ? expanded.slice(-clampedLimit) : expanded;
+          btcSource = 'okx_usdt';
+        }
+      }
+      if (result.length === 0) {
+        const kraken1m = await fetchKrakenCandles('XBTUSD', '1m', Math.min(720, Math.ceil((clampedLimit * bucketMs) / 60_000) + 5), endTime);
+        if (kraken1m && kraken1m.length > 0) {
+          const expanded = expand1mCandlesToSubMinute(kraken1m, bucketMs, endTime ? endTime + 1 : Number.MAX_SAFE_INTEGER);
+          result = expanded.length > clampedLimit ? expanded.slice(-clampedLimit) : expanded;
+          btcSource = 'kraken_usd';
+        }
+      }
+      if (result.length === 0) {
+        const liveFallback = getLive1sAggregated('BTCUSD', bucketMs, endTime);
+        if (liveFallback.length > 0) {
+          result = liveFallback.length > clampedLimit ? liveFallback.slice(-clampedLimit) : liveFallback;
+          btcSource = 'spot_live';
+        }
+      }
+    } else {
+      try {
+        const totalNeeded = Math.min(3000, clampedLimit * multiplier + multiplier);
+        const pagesNeeded = Math.min(3, Math.ceil(totalNeeded / 1000));
+        let allBase: Candle[] = [];
+        let cursorEnd = endTime;
+
+        for (let p = 0; p < pagesNeeded; p++) {
+          const reqLimit = Math.min(1000, totalNeeded - allBase.length);
+          if (reqLimit <= 0) break;
+          const params = new URLSearchParams({
+            symbol: cfg.providerSymbol,
+            interval: spec.native,
+            limit: String(reqLimit),
+          });
+          if (cursorEnd && Number.isFinite(cursorEnd)) {
+            params.set('endTime', String(Math.floor(cursorEnd)));
+          }
+          if (startTime && Number.isFinite(startTime) && pagesNeeded === 1) {
+            params.set('startTime', String(Math.floor(startTime)));
+          }
+          const raw = await fetchBinanceJson<unknown[][]>(`/api/v3/klines?${params.toString()}`);
+          const parsed = parseBinanceKlines(raw);
+          if (parsed.length === 0) break;
+          allBase = [...parsed, ...allBase];
+          cursorEnd = parsed[0].time - 1;
+          if (parsed.length < reqLimit) break;
+        }
+
+        const dedupedMap = new Map<number, Candle>();
+        for (const c of allBase) {
+          dedupedMap.set(c.time, c);
+        }
+        result = Array.from(dedupedMap.values()).sort((a, b) => a.time - b.time);
+
+        if (spec.bucketMs) {
+          result = aggregateCandlesByMs(result, spec.bucketMs);
+        } else if (spec.monthFactor) {
+          result = aggregateCandlesByMonths(result, spec.monthFactor);
+        }
+        if (result.length > clampedLimit) {
+          result = result.slice(result.length - clampedLimit);
+        }
+        btcSource = 'binance_usdt';
+      } catch {
+        // Binance failed/rate-limited on shared cloud IP -> fall through to OKX/Kraken
       }
 
-      const dedupedMap = new Map<number, Candle>();
-      for (const c of allBase) {
-        dedupedMap.set(c.time, c);
+      if (result.length === 0) {
+        const okxBtc = await fetchOkxCandles('BTC-USDT', interval, clampedLimit, endTime);
+        if (okxBtc && okxBtc.length > 0) {
+          result = okxBtc;
+          btcSource = 'okx_usdt';
+        }
       }
-      result = Array.from(dedupedMap.values()).sort((a, b) => a.time - b.time);
 
-      if (spec.bucketMs) {
-        result = aggregateCandlesByMs(result, spec.bucketMs);
-      } else if (spec.monthFactor) {
-        result = aggregateCandlesByMonths(result, spec.monthFactor);
-      }
-      if (result.length > clampedLimit) {
-        result = result.slice(result.length - clampedLimit);
-      }
-    } catch {
-      // Binance failed/rate-limited on shared cloud IP -> fall through to Coinbase/OKX/Kraken
-    }
-
-    if (result.length === 0 && spec.native === '1s') {
-      result = await fetchCoinbaseBtcSubMinuteCandles(interval, clampedLimit, endTime);
-    }
-
-    if (result.length === 0) {
-      const okxBtc = await fetchOkxCandles('BTC-USDT', interval, clampedLimit, endTime);
-      if (okxBtc && okxBtc.length > 0) {
-        result = okxBtc;
-      }
-    }
-
-    if (result.length === 0) {
-      const krakenBtc = await fetchKrakenCandles('XBTUSD', interval, clampedLimit, endTime);
-      if (krakenBtc && krakenBtc.length > 0) {
-        result = krakenBtc;
+      if (result.length === 0) {
+        const krakenBtc = await fetchKrakenCandles('XBTUSD', interval, clampedLimit, endTime);
+        if (krakenBtc && krakenBtc.length > 0) {
+          result = krakenBtc;
+          btcSource = 'kraken_usd';
+        }
       }
     }
   }
@@ -1373,7 +1679,7 @@ async function fetchHistoricalCandles(
       const targetSpot = liveTickers.XAUUSD?.price || xauSpotPrice;
       let basis = xauSourceBasis[xauSource] ?? 0;
 
-      if (xauSource === 'twelvedata') {
+      if (xauSource === 'twelvedata' || xauSource === 'spot_live') {
         basis = 0;
       } else if (!endTime && !startTime && targetSpot > 0 && rawLast > 0) {
         const diff = targetSpot - rawLast;
@@ -1388,7 +1694,7 @@ async function fetchHistoricalCandles(
             xauBasisUpdatedAt = Date.now();
           }
         }
-      } else if (xauSource === 'xauusdt' && basis === 0) {
+      } else if ((xauSource === 'xauusdt' || xauSource === 'okx_xau') && basis === 0) {
         basis = getXauBasis();
       }
 
@@ -1408,13 +1714,14 @@ async function fetchHistoricalCandles(
         last.low = Math.min(last.low, targetSpot);
       }
     } else if (market === 'BTCUSD') {
+      const isUsdtFeed = btcSource === 'binance_usdt' || btcSource === 'okx_usdt';
       const rawLast = result[result.length - 1].close;
-      if (!endTime && !startTime && rawLast > 0) {
+      if (isUsdtFeed && !endTime && !startTime && rawLast > 0) {
         btcUsdtRefPrice = rawLast;
       }
       const targetBtc = liveTickers.BTCUSD?.price || btcSpotPrice;
-      let ratio = getBtcUsdRatio();
-      if (!endTime && !startTime && targetBtc > 0 && rawLast > 0) {
+      let ratio = isUsdtFeed ? getBtcUsdRatio() : 1;
+      if (isUsdtFeed && !endTime && !startTime && targetBtc > 0 && rawLast > 0) {
         const directRatio = targetBtc / rawLast;
         if (directRatio > 0.95 && directRatio < 1.05) {
           ratio = directRatio;
@@ -1452,6 +1759,7 @@ function nextMonotonicTickTs(market: MarketSymbol): number {
   lastEmittedTickTs[market] = next;
   return next;
 }
+const serverBootAt = Date.now();
 let connectionStatus: ConnectionStatus = 'DISCONNECTED';
 let lastUpstreamMessageAt = 0;
 let upstreamWs: WebSocket | null = null;
@@ -1774,6 +2082,7 @@ async function startServer() {
             timestamp: tickTs,
           };
           liveTickers.BTCUSD = updatedTicker;
+          recordLive1sTick('BTCUSD', price, Number.isFinite(qty) ? qty : 0, now);
 
           broadcast({
             type: 'tick',
@@ -1870,7 +2179,10 @@ async function startServer() {
           if (!Number.isFinite(rawPrice) || rawPrice <= 0) return;
 
           xauFuturesLastPrice = rawPrice;
-          // Wait for initial spot anchor before emitting raw futures if spot not yet fetched in first ~1s
+          // Wait for initial spot anchor before emitting raw futures if spot not yet fetched in first ~5s
+          if (xauSpotUpdatedAt === 0 && now - serverBootAt < 5000) {
+            return;
+          }
           if (xauBasisUpdatedAt === 0 && xauSpotPrice > 0) {
             const diff = xauSpotPrice - rawPrice;
             if (Math.abs(diff) < xauSpotPrice * 0.05) {
@@ -1908,6 +2220,7 @@ async function startServer() {
             timestamp: tickTs,
           };
           liveTickers.XAUUSD = updatedTicker;
+          recordLive1sTick('XAUUSD', calibrated, qty, now);
           broadcast({
             type: 'tick',
             market: 'XAUUSD',
@@ -2038,6 +2351,7 @@ async function startServer() {
               timestamp: tickTs,
             };
             liveTickers.BTCUSD = updatedTicker;
+            recordLive1sTick('BTCUSD', price, qty, Date.now());
             broadcast({
               type: 'tick',
               market: 'BTCUSD',
@@ -2117,6 +2431,7 @@ async function startServer() {
     lastIdleSpotPollAt = nowCheck;
     try {
       const spot = await fetchSwissquoteXauSpot();
+      const xauFuturesOpen = Boolean(xauFuturesWs && xauFuturesWs.readyState === WebSocket.OPEN);
       if (spot && spot > 0) {
         const now = Date.now();
         if (!updateXauSpotAnchor(spot, now)) {
@@ -2125,8 +2440,10 @@ async function startServer() {
         lastUpstreamMessageAt = now;
 
         const existing = liveTickers.XAUUSD;
-        // Only broadcast directly from REST poll if futures stream hasn't ticked in >2.2s
-        if (!existing || (now - lastTradeAt.XAUUSD > 2200 && existing.price !== spot)) {
+        // Broadcast directly from institutional Spot feed when futures WS is closed or hasn't ticked in >1.2s
+        if (!existing || ((!xauFuturesOpen || now - lastTradeAt.XAUUSD > 1200) && existing.price !== spot)) {
+          lastTradeAt.XAUUSD = now;
+          recordLive1sTick('XAUUSD', spot, 0, now);
           const tickTs = nextMonotonicTickTs('XAUUSD');
           const open24h = existing?.open24h || spot;
           const change = roundPrice(spot - open24h);
@@ -2162,6 +2479,9 @@ async function startServer() {
         if (goldApiSpot && goldApiSpot > 0) {
           const now = Date.now();
           if (updateXauSpotAnchor(goldApiSpot, now)) {
+            lastUpstreamMessageAt = now;
+            lastTradeAt.XAUUSD = now;
+            recordLive1sTick('XAUUSD', goldApiSpot, 0, now);
             const tickTs = nextMonotonicTickTs('XAUUSD');
             const existing = liveTickers.XAUUSD;
             const open24h = existing?.open24h || goldApiSpot;

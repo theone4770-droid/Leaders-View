@@ -289,18 +289,17 @@ export default function App() {
     setSelectedDrawingId(null);
 
     const applyLoadedCandles = (candles: Candle[], status: ConnectionStatus) => {
-      const syncedCandles =
-        candles.length > 0 && tickersRef.current[market]?.price
-          ? [
-              ...candles.slice(0, -1),
-              {
-                ...candles[candles.length - 1],
-                close: tickersRef.current[market]!.price,
-                high: Math.max(candles[candles.length - 1].high, tickersRef.current[market]!.price),
-                low: Math.min(candles[candles.length - 1].low, tickersRef.current[market]!.price),
-              },
-            ]
-          : candles;
+      const syncedCandles = candles.map((c) => ({ ...c }));
+      const liveTicker = tickersRef.current[market];
+      if (syncedCandles.length > 0 && liveTicker && liveTicker.price > 0) {
+        applyTickToCandles(
+          syncedCandles,
+          liveTicker.price,
+          0,
+          liveTicker.timestamp || Date.now(),
+          currentInterval
+        );
+      }
       candlesRef.current = syncedCandles;
       loadedKeyRef.current = `${market}:${currentInterval}`;
       setCandlesVersion((v) => v + 1);
@@ -571,15 +570,14 @@ export default function App() {
           loadedKeyRef.current === `${activeMarket}:${intervalRef.current}` &&
           candlesRef.current.length > 0
         ) {
-          const lastIdx = candlesRef.current.length - 1;
-          const last = candlesRef.current[lastIdx];
-          if (last.close !== activeTicker.price) {
-            candlesRef.current[lastIdx] = {
-              ...last,
-              close: activeTicker.price,
-              high: Math.max(last.high, activeTicker.price),
-              low: Math.min(last.low, activeTicker.price),
-            };
+          const { updated } = applyTickToCandles(
+            candlesRef.current,
+            activeTicker.price,
+            0,
+            activeTicker.timestamp || Date.now(),
+            intervalRef.current
+          );
+          if (updated) {
             chartRef.current?.requestRedraw();
           }
         }
