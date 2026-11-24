@@ -1,7 +1,8 @@
-import React from 'react';
+import React, { useRef } from 'react';
 import { Pause, Play, SkipBack, SkipForward, X } from 'lucide-react';
 import { ReplaySpeed, ReplayState } from '../types/chart';
 import { REPLAY_SPEEDS } from '../modules/barReplayManager';
+import { useAnimatedPresence } from '../hooks/useAnimatedPresence';
 
 interface BarReplayControlsProps {
   replay: ReplayState;
@@ -24,20 +25,29 @@ export const BarReplayControls: React.FC<BarReplayControlsProps> = React.memo(({
   onChangeSpeed,
   onExit,
 }) => {
-  if (replay.mode === 'OFF') return null;
+  const { shouldRender, isClosing } = useAnimatedPresence(replay.mode !== 'OFF', 145);
+  const lastModeRef = useRef<ReplayState['mode']>(replay.mode);
+  if (replay.mode !== 'OFF') {
+    lastModeRef.current = replay.mode;
+  }
+  const activeMode = replay.mode !== 'OFF' ? replay.mode : lastModeRef.current;
 
-  if (replay.mode === 'SELECTING') {
+  if (!shouldRender || activeMode === 'OFF') return null;
+
+  if (activeMode === 'SELECTING') {
     return (
       <div
         data-testid="bar-replay-select-banner"
-        className="lv-gpu-layer fixed top-3 left-1/2 -translate-x-1/2 z-30 flex flex-nowrap items-center gap-2.5 w-max max-w-[calc(100vw-16px)] overflow-x-auto no-scrollbar whitespace-nowrap rounded-lg border border-[#FFFFFF]/45 bg-[#0D0D10]/96 px-3.5 py-1.5 text-xs text-[#F5F5F7] shadow-2xl select-none"
+        className={`lv-gpu-layer ${
+          isClosing ? 'animate-lv-panel-out pointer-events-none' : 'animate-lv-panel-in'
+        } fixed top-3 left-1/2 -translate-x-1/2 z-30 flex flex-nowrap items-center gap-2.5 w-max max-w-[calc(100vw-16px)] overflow-x-auto no-scrollbar whitespace-nowrap rounded-lg border border-[#FFFFFF]/45 bg-[#0D0D10]/96 px-3.5 py-1.5 text-xs text-[#F5F5F7] shadow-2xl select-none`}
       >
         <span className="shrink-0 font-bold tracking-[0.14em] text-[#FFFFFF]">BAR REPLAY</span>
         <span className="shrink-0 text-[#C7C4BC]">TAP OR CLICK ANY HISTORICAL CANDLE TO SET START POINT</span>
         <button
           type="button"
           onClick={onExit}
-          className="flex shrink-0 items-center gap-1 rounded border border-[#FFFFFF]/35 px-2 py-1 text-[11px] font-bold text-[#FFFFFF] hover:bg-[#FFFFFF]/15 cursor-pointer"
+          className="flex shrink-0 items-center gap-1 rounded border border-[#FFFFFF]/35 px-2 py-1 text-[11px] font-bold text-[#FFFFFF] hover:bg-[#FFFFFF]/15 active:scale-95 transition-transform cursor-pointer"
         >
           <X className="w-3.5 h-3.5" />
           <span>CANCEL</span>
@@ -46,13 +56,15 @@ export const BarReplayControls: React.FC<BarReplayControlsProps> = React.memo(({
     );
   }
 
-  const isPlaying = replay.mode === 'PLAYING';
+  const isPlaying = activeMode === 'PLAYING';
   const currentBar = (replay.cutIndex ?? 0) + 1;
 
   return (
     <div
       data-testid="bar-replay-controls"
-      className="lv-gpu-layer fixed bottom-14 left-1/2 -translate-x-1/2 z-30 flex flex-nowrap items-center gap-1.5 w-max max-w-[calc(100vw-16px)] overflow-x-auto no-scrollbar whitespace-nowrap rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/40 bg-[#FFFFFF]/96 dark:bg-[#0E0E11]/96 px-3 py-1.5 shadow-2xl select-none"
+      className={`lv-gpu-layer ${
+        isClosing ? 'animate-lv-panel-out pointer-events-none' : 'animate-lv-panel-in'
+      } fixed bottom-14 left-1/2 -translate-x-1/2 z-30 flex flex-nowrap items-center gap-1.5 w-max max-w-[calc(100vw-16px)] overflow-x-auto no-scrollbar whitespace-nowrap rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/40 bg-[#FFFFFF]/96 dark:bg-[#0E0E11]/96 px-3 py-1.5 shadow-2xl select-none`}
     >
       <span className="shrink-0 text-[10.5px] font-bold tracking-[0.14em] text-[#141311] dark:text-[#FFFFFF] mr-0.5">
         BAR REPLAY

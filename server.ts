@@ -293,28 +293,67 @@ function aggregateCandlesByMonths(candles: Candle[], months: number): Candle[] {
 // Spot Basis & Direct USD Price Calibration
 let xauSpotPrice = 0;
 let xauSpotUpdatedAt = 0;
-let xauRefPrice = 0;
+let xauFuturesLastPrice = 0;
+let xauBasisLocked = 0;
+let xauBasisUpdatedAt = 0;
 const xauSourceBasis: Record<string, number> = {};
 let btcSpotPrice = 0;
 let btcSpotUpdatedAt = 0;
 let btcUsdtRefPrice = 0;
+let btcUsdRatioLocked = 1;
+let btcUsdRatioUpdatedAt = 0;
+
+function updateXauSpotAnchor(spot: number, now = Date.now()): boolean {
+  if (!Number.isFinite(spot) || spot <= 0) return false;
+  // Reject isolated >1.5% single-poll outlier glitch if we have a recent spot anchor
+  if (xauSpotPrice > 0 && now - xauSpotUpdatedAt < 120_000) {
+    if (Math.abs(spot - xauSpotPrice) > xauSpotPrice * 0.015) {
+      return false;
+    }
+  }
+  xauSpotPrice = spot;
+  xauSpotUpdatedAt = now;
+  if (xauFuturesLastPrice > 0) {
+    const rawDiff = spot - xauFuturesLastPrice;
+    if (Math.abs(rawDiff) < spot * 0.05) {
+      xauBasisLocked =
+        xauBasisUpdatedAt > 0 && Math.abs(rawDiff - xauBasisLocked) < 2.5
+          ? roundPrice(xauBasisLocked * 0.4 + rawDiff * 0.6)
+          : roundPrice(rawDiff);
+      xauBasisUpdatedAt = now;
+    }
+  }
+  return true;
+}
 
 function getXauBasis(): number {
-  if (xauSpotPrice > 0 && xauRefPrice > 0 && Date.now() - xauSpotUpdatedAt < 60_000) {
-    const diff = xauSpotPrice - xauRefPrice;
-    if (Math.abs(diff) < xauSpotPrice * 0.05) {
-      return diff;
-    }
+  if (xauBasisUpdatedAt > 0 && Date.now() - xauBasisUpdatedAt < 600_000) {
+    return xauBasisLocked;
   }
   return 0;
 }
 
+function updateBtcUsdtCalibration(spotUsd: number, usdtPrice: number, now = Date.now()): void {
+  if (spotUsd > 0 && usdtPrice > 0) {
+    const ratio = spotUsd / usdtPrice;
+    if (ratio > 0.95 && ratio < 1.05) {
+      btcUsdRatioLocked = ratio;
+      btcUsdRatioUpdatedAt = now;
+    }
+  }
+}
+
 function getBtcUsdRatio(): number {
-  if (btcSpotPrice > 0 && btcUsdtRefPrice > 0 && Date.now() - btcSpotUpdatedAt < 60_000) {
+  if (btcSpotPrice > 0 && btcUsdtRefPrice > 0 && Date.now() - btcSpotUpdatedAt < 600_000) {
     const ratio = btcSpotPrice / btcUsdtRefPrice;
     if (ratio > 0.95 && ratio < 1.05) {
+      btcUsdRatioLocked = ratio;
+      btcUsdRatioUpdatedAt = Date.now();
       return ratio;
     }
+  }
+  if (btcUsdRatioUpdatedAt > 0 && Date.now() - btcUsdRatioUpdatedAt < 600_000) {
+    return btcUsdRatioLocked;
   }
   return 1;
 }
@@ -337,9 +376,12 @@ async function fetchSwissquoteXauSpot(): Promise<number | null> {
     }>;
     const profiles = data?.[0]?.spreadProfilePrices;
     if (!Array.isArray(profiles) || profiles.length === 0) return null;
-    const elite = profiles.find((p) => p.spreadProfile === 'elite') ?? profiles[0];
-    if (typeof elite.bid === 'number' && typeof elite.ask === 'number' && elite.bid > 0 && elite.ask > 0) {
-      return roundPrice((elite.bid + elite.ask) / 2);
+    const picked =
+      profiles.find((p) => p.spreadProfile === 'elite') ??
+      profiles.find((p) => p.spreadProfile === 'prime') ??
+      profiles[0];
+    if (typeof picked.bid === 'number' && typeof picked.ask === 'number' && picked.bid > 0 && picked.ask > 0) {
+      return roundPrice((picked.bid + picked.ask) / 2);
     }
     return null;
   } catch {
@@ -591,22 +633,36 @@ async function fetchCoinbaseBtcSubMinuteCandles(
 
 let spotInitPromise: Promise<void> | null = null;
 async function ensureSpotCalibration(): Promise<void> {
-  if (xauSpotPrice > 0 && btcSpotPrice > 0) return;
+  if (xauSpotPrice > 0 && btcSpotPrice > 0 && btcUsdtRefPrice > 0) return;
   if (!spotInitPromise) {
     spotInitPromise = (async () => {
       await Promise.all([
         (async () => {
-          const spot = (await fetchSwissquoteXauSpot()) ?? (await fetchGoldApiSpot());
+          const [spot, fapi] = await Promise.all([
+            fetchSwissquoteXauSpot().then(async (p) => p ?? (await fetchGoldApiSpot())),
+            fetchBinanceFuturesJson<{ price?: string }>('/fapi/v1/ticker/price?symbol=XAUUSDT').catch(() => null),
+          ]);
+          if (fapi?.price && Number(fapi.price) > 0) {
+            xauFuturesLastPrice = Number(fapi.price);
+          }
           if (spot && spot > 0) {
-            xauSpotPrice = spot;
-            xauSpotUpdatedAt = Date.now();
+            updateXauSpotAnchor(spot);
           }
         })(),
         (async () => {
-          const stats = await fetchCoinbaseBtcStats();
+          const [stats, btcUsdt] = await Promise.all([
+            fetchCoinbaseBtcStats(),
+            fetchBinanceJson<{ price?: string }>('/api/v3/ticker/price?symbol=BTCUSDT').catch(() => null),
+          ]);
+          if (btcUsdt?.price && Number(btcUsdt.price) > 0) {
+            btcUsdtRefPrice = Number(btcUsdt.price);
+          }
           if (stats && stats.last > 0) {
             btcSpotPrice = stats.last;
             btcSpotUpdatedAt = Date.now();
+            if (btcUsdtRefPrice > 0) {
+              updateBtcUsdtCalibration(btcSpotPrice, btcUsdtRefPrice);
+            }
           }
         })(),
       ]);
@@ -1326,7 +1382,11 @@ async function fetchHistoricalCandles(
           xauSourceBasis[xauSource] = basis;
         }
         if (xauSource === 'xauusdt') {
-          xauRefPrice = rawLast;
+          xauFuturesLastPrice = rawLast;
+          if (xauSpotPrice > 0 && xauBasisUpdatedAt === 0) {
+            xauBasisLocked = basis;
+            xauBasisUpdatedAt = Date.now();
+          }
         }
       } else if (xauSource === 'xauusdt' && basis === 0) {
         basis = getXauBasis();
@@ -1348,10 +1408,19 @@ async function fetchHistoricalCandles(
         last.low = Math.min(last.low, targetSpot);
       }
     } else if (market === 'BTCUSD') {
-      if (!endTime && !startTime) {
-        btcUsdtRefPrice = result[result.length - 1].close;
+      const rawLast = result[result.length - 1].close;
+      if (!endTime && !startTime && rawLast > 0) {
+        btcUsdtRefPrice = rawLast;
       }
-      const ratio = getBtcUsdRatio();
+      const targetBtc = liveTickers.BTCUSD?.price || btcSpotPrice;
+      let ratio = getBtcUsdRatio();
+      if (!endTime && !startTime && targetBtc > 0 && rawLast > 0) {
+        const directRatio = targetBtc / rawLast;
+        if (directRatio > 0.95 && directRatio < 1.05) {
+          ratio = directRatio;
+          updateBtcUsdtCalibration(targetBtc, rawLast);
+        }
+      }
       if (ratio !== 1) {
         result = result.map((c) => ({
           ...c,
@@ -1361,11 +1430,11 @@ async function fetchHistoricalCandles(
           close: roundPrice(c.close * ratio),
         }));
       }
-      if (!endTime && !startTime && btcSpotPrice > 0) {
+      if (!endTime && !startTime && targetBtc > 0) {
         const last = result[result.length - 1];
-        last.close = btcSpotPrice;
-        last.high = Math.max(last.high, btcSpotPrice);
-        last.low = Math.min(last.low, btcSpotPrice);
+        last.close = targetBtc;
+        last.high = Math.max(last.high, targetBtc);
+        last.low = Math.min(last.low, targetBtc);
       }
     }
   }
@@ -1438,9 +1507,11 @@ async function refreshTickersFromRest(): Promise<void> {
       fetchCoinbaseBtcStats(),
     ]);
 
+    if (xau24h && Number(xau24h.lastPrice) > 0) {
+      xauFuturesLastPrice = Number(xau24h.lastPrice);
+    }
     if (sqGold && sqGold > 0) {
-      xauSpotPrice = sqGold;
-      xauSpotUpdatedAt = Date.now();
+      updateXauSpotAnchor(sqGold);
     }
     if (cbBtc && cbBtc.last > 0) {
       btcSpotPrice = cbBtc.last;
@@ -1452,27 +1523,37 @@ async function refreshTickersFromRest(): Promise<void> {
       if (item.symbol === 'PAXGUSDT') {
         paxg24h = item;
       } else if (item.symbol === 'BTCUSDT') {
-        btcUsdtRefPrice = Number(item.lastPrice) || btcUsdtRefPrice;
-        const price = cbBtc ? cbBtc.last : roundPrice(Number(item.lastPrice) * getBtcUsdRatio());
-        const open24h = cbBtc ? cbBtc.open : roundPrice(Number(item.openPrice) * getBtcUsdRatio());
-        const high24h = cbBtc ? cbBtc.high : roundPrice(Number(item.highPrice) * getBtcUsdRatio());
-        const low24h = cbBtc ? cbBtc.low : roundPrice(Number(item.lowPrice) * getBtcUsdRatio());
-        const change = roundPrice(price - open24h);
-        const changePercent = open24h > 0 ? (change / open24h) * 100 : 0;
-        liveTickers.BTCUSD = {
-          market: 'BTCUSD',
-          symbol: 'BTCUSD',
-          description: MARKET_CONFIG.BTCUSD.description,
-          providerSymbol: 'BTC-USD',
-          price,
-          open24h,
-          change,
-          changePercent,
-          high24h,
-          low24h,
-          volume24h: cbBtc ? cbBtc.volume : Number(item.volume),
-          timestamp: item.closeTime || Date.now(),
-        };
+        const usdtLast = Number(item.lastPrice);
+        if (usdtLast > 0) {
+          btcUsdtRefPrice = usdtLast;
+          if (btcSpotPrice > 0) {
+            updateBtcUsdtCalibration(btcSpotPrice, usdtLast);
+          }
+        }
+        // Never overwrite fresher WS BTCUSD tick with older REST price
+        const wsFreshBtc = Date.now() - lastTradeAt.BTCUSD < 5000 && liveTickers.BTCUSD;
+        if (!wsFreshBtc) {
+          const price = cbBtc ? cbBtc.last : roundPrice(usdtLast * getBtcUsdRatio());
+          const open24h = cbBtc ? cbBtc.open : roundPrice(Number(item.openPrice) * getBtcUsdRatio());
+          const high24h = cbBtc ? cbBtc.high : roundPrice(Number(item.highPrice) * getBtcUsdRatio());
+          const low24h = cbBtc ? cbBtc.low : roundPrice(Number(item.lowPrice) * getBtcUsdRatio());
+          const change = roundPrice(price - open24h);
+          const changePercent = open24h > 0 ? (change / open24h) * 100 : 0;
+          liveTickers.BTCUSD = {
+            market: 'BTCUSD',
+            symbol: 'BTCUSD',
+            description: MARKET_CONFIG.BTCUSD.description,
+            providerSymbol: 'BTC-USD',
+            price,
+            open24h,
+            change,
+            changePercent,
+            high24h,
+            low24h,
+            volume24h: cbBtc ? cbBtc.volume : Number(item.volume),
+            timestamp: nextMonotonicTickTs('BTCUSD'),
+          };
+        }
       }
     }
 
@@ -1484,28 +1565,32 @@ async function refreshTickersFromRest(): Promise<void> {
           : null;
 
     if (xauSourceTicker) {
-      xauRefPrice = Number(xauSourceTicker.lastPrice);
-      const basis = getXauBasis();
-      const price = sqGold ?? roundPrice(xauRefPrice + basis);
-      const open24h = roundPrice(Number(xauSourceTicker.openPrice) + basis);
-      const high24h = Math.max(price, roundPrice(Number(xauSourceTicker.highPrice) + basis));
-      const low24h = Math.min(price, roundPrice(Number(xauSourceTicker.lowPrice) + basis));
-      const change = roundPrice(price - open24h);
-      const changePercent = open24h > 0 ? (change / open24h) * 100 : 0;
-      liveTickers.XAUUSD = {
-        market: 'XAUUSD',
-        symbol: 'XAUUSD',
-        description: MARKET_CONFIG.XAUUSD.description,
-        providerSymbol: 'XAU/USD',
-        price,
-        open24h,
-        change,
-        changePercent,
-        high24h,
-        low24h,
-        volume24h: Number(xauSourceTicker.volume) || 0,
-        timestamp: Date.now(),
-      };
+      const refNum = Number(xauSourceTicker.lastPrice);
+      const isFutures = xauSourceTicker === xau24h;
+      const basis = isFutures ? getXauBasis() : (xauSpotPrice > 0 ? roundPrice(xauSpotPrice - refNum) : 0);
+      const wsFreshXau = Date.now() - lastTradeAt.XAUUSD < 3000 && liveTickers.XAUUSD;
+      if (!wsFreshXau) {
+        const price = sqGold ?? roundPrice(refNum + basis);
+        const open24h = roundPrice(Number(xauSourceTicker.openPrice) + basis);
+        const high24h = Math.max(price, roundPrice(Number(xauSourceTicker.highPrice) + basis));
+        const low24h = Math.min(price, roundPrice(Number(xauSourceTicker.lowPrice) + basis));
+        const change = roundPrice(price - open24h);
+        const changePercent = open24h > 0 ? (change / open24h) * 100 : 0;
+        liveTickers.XAUUSD = {
+          market: 'XAUUSD',
+          symbol: 'XAUUSD',
+          description: MARKET_CONFIG.XAUUSD.description,
+          providerSymbol: 'XAU/USD',
+          price,
+          open24h,
+          change,
+          changePercent,
+          high24h,
+          low24h,
+          volume24h: Number(xauSourceTicker.volume) || 0,
+          timestamp: nextMonotonicTickTs('XAUUSD'),
+        };
+      }
     }
 
     if (cbBtc && !liveTickers.BTCUSD) {
@@ -1651,10 +1736,18 @@ async function startServer() {
           if (!Number.isFinite(price) || price <= 0) return;
 
           const now = Date.now();
-          const tradeTime = msg.time ? Date.parse(msg.time) || now : now;
+          const tickTs = nextMonotonicTickTs('BTCUSD');
           const qty = Number(msg.last_size) || 0;
+          const existing = liveTickers.BTCUSD;
+          // Reject impossible single-tick spike (>5%)
+          if (existing && Math.abs(price - existing.price) > existing.price * 0.05) {
+            return;
+          }
           btcSpotPrice = price;
           btcSpotUpdatedAt = now;
+          if (btcUsdtRefPrice > 0) {
+            updateBtcUsdtCalibration(price, btcUsdtRefPrice, now);
+          }
           lastTradeAt.BTCUSD = now;
           lastUpstreamMessageAt = now;
           if (connectionStatus !== 'LIVE') {
@@ -1662,7 +1755,6 @@ async function startServer() {
             broadcast({ type: 'status', connectionStatus: 'LIVE', serverTime: now });
           }
 
-          const existing = liveTickers.BTCUSD;
           const open24h = Number(msg.open_24h) || existing?.open24h || price;
           const change = roundPrice(price - open24h);
           const changePercent = open24h > 0 ? (change / open24h) * 100 : 0;
@@ -1679,7 +1771,7 @@ async function startServer() {
             high24h: Number(msg.high_24h) || (existing ? Math.max(existing.high24h, price) : price),
             low24h: Number(msg.low_24h) || (existing ? Math.min(existing.low24h, price) : price),
             volume24h: Number(msg.volume_24h) || existing?.volume24h || 0,
-            timestamp: tradeTime,
+            timestamp: tickTs,
           };
           liveTickers.BTCUSD = updatedTicker;
 
@@ -1688,7 +1780,7 @@ async function startServer() {
             market: 'BTCUSD',
             price,
             volume: Number.isFinite(qty) ? qty : 0,
-            timestamp: tradeTime,
+            timestamp: tickTs,
             ticker: updatedTicker,
           });
         } catch {
@@ -1777,9 +1869,19 @@ async function startServer() {
           }
           if (!Number.isFinite(rawPrice) || rawPrice <= 0) return;
 
-          xauRefPrice = rawPrice;
+          xauFuturesLastPrice = rawPrice;
+          // Wait for initial spot anchor before emitting raw futures if spot not yet fetched in first ~1s
+          if (xauBasisUpdatedAt === 0 && xauSpotPrice > 0) {
+            const diff = xauSpotPrice - rawPrice;
+            if (Math.abs(diff) < xauSpotPrice * 0.05) {
+              xauBasisLocked = roundPrice(diff);
+              xauBasisUpdatedAt = now;
+            }
+          }
           const calibrated = roundPrice(rawPrice + getXauBasis());
           const existing = liveTickers.XAUUSD;
+          // Guard against >1.5% outlier jump
+          if (existing && Math.abs(calibrated - existing.price) > existing.price * 0.015) return;
 
           // Throttle redundant bookTicker frames while emitting every genuine price change immediately
           if (existing && existing.price === calibrated && qty === 0) return;
@@ -2014,16 +2116,17 @@ async function startServer() {
     xauPollActive = true;
     lastIdleSpotPollAt = nowCheck;
     try {
-      const spot = (await fetchSwissquoteXauSpot()) ?? (wss.clients.size > 0 ? await fetchGoldApiSpot() : null);
+      const spot = await fetchSwissquoteXauSpot();
       if (spot && spot > 0) {
         const now = Date.now();
-        xauSpotPrice = spot;
-        xauSpotUpdatedAt = now;
+        if (!updateXauSpotAnchor(spot, now)) {
+          return;
+        }
         lastUpstreamMessageAt = now;
 
         const existing = liveTickers.XAUUSD;
-        // Only broadcast directly from REST poll if futures stream hasn't ticked recently or price drifted
-        if (!existing || (now - lastTradeAt.XAUUSD > 1200 && existing.price !== spot)) {
+        // Only broadcast directly from REST poll if futures stream hasn't ticked in >2.2s
+        if (!existing || (now - lastTradeAt.XAUUSD > 2200 && existing.price !== spot)) {
           const tickTs = nextMonotonicTickTs('XAUUSD');
           const open24h = existing?.open24h || spot;
           const change = roundPrice(spot - open24h);
@@ -2048,6 +2151,40 @@ async function startServer() {
               type: 'tick',
               market: 'XAUUSD',
               price: spot,
+              volume: 0,
+              timestamp: tickTs,
+              ticker: updatedTicker,
+            });
+          }
+        }
+      } else if (wss.clients.size > 0 && Date.now() - lastTradeAt.XAUUSD > 3000) {
+        const goldApiSpot = await fetchGoldApiSpot();
+        if (goldApiSpot && goldApiSpot > 0) {
+          const now = Date.now();
+          if (updateXauSpotAnchor(goldApiSpot, now)) {
+            const tickTs = nextMonotonicTickTs('XAUUSD');
+            const existing = liveTickers.XAUUSD;
+            const open24h = existing?.open24h || goldApiSpot;
+            const change = roundPrice(goldApiSpot - open24h);
+            const updatedTicker: TickerData = {
+              market: 'XAUUSD',
+              symbol: 'XAUUSD',
+              description: MARKET_CONFIG.XAUUSD.description,
+              providerSymbol: 'XAU/USD',
+              price: goldApiSpot,
+              open24h,
+              change,
+              changePercent: open24h > 0 ? (change / open24h) * 100 : 0,
+              high24h: existing ? Math.max(existing.high24h, goldApiSpot) : goldApiSpot,
+              low24h: existing ? Math.min(existing.low24h, goldApiSpot) : goldApiSpot,
+              volume24h: existing?.volume24h ?? 0,
+              timestamp: tickTs,
+            };
+            liveTickers.XAUUSD = updatedTicker;
+            broadcast({
+              type: 'tick',
+              market: 'XAUUSD',
+              price: goldApiSpot,
               volume: 0,
               timestamp: tickTs,
               ticker: updatedTicker,

@@ -11,6 +11,7 @@ import {
   getNotificationPermission,
   requestAlertNotificationPermission,
 } from '../modules/alertsManager';
+import { useAnimatedPresence } from '../hooks/useAnimatedPresence';
 
 interface AlertsModalProps {
   open: boolean;
@@ -51,6 +52,7 @@ export const AlertsModal: React.FC<AlertsModalProps> = React.memo(({
   onDeleteAlert,
   onClose,
 }) => {
+  const { shouldRender, isClosing } = useAnimatedPresence(open, 155);
   const [priceInput, setPriceInput] = useState('');
   const [condition, setCondition] = useState<AlertCondition>('CROSSING');
   const [note, setNote] = useState('');
@@ -60,12 +62,27 @@ export const AlertsModal: React.FC<AlertsModalProps> = React.memo(({
   );
 
   useEffect(() => {
-    if (open && !editingId && currentPrice !== undefined && !priceInput) {
+    setEditingId(null);
+    setNote('');
+    setPriceInput('');
+  }, [market]);
+
+  useEffect(() => {
+    if (!shouldRender) {
+      setEditingId(null);
+      setNote('');
+      setPriceInput('');
+    }
+  }, [shouldRender]);
+
+  useEffect(() => {
+    if (!open) return;
+    if (!editingId && currentPrice !== undefined && !priceInput) {
       setPriceInput(currentPrice.toFixed(MARKETS[market].decimals));
     }
   }, [open, currentPrice, market, editingId, priceInput]);
 
-  if (!open) return null;
+  if (!shouldRender) return null;
 
   const meta = MARKETS[market];
   const marketAlerts = alerts.filter((a) => a.market === market);
@@ -98,11 +115,15 @@ export const AlertsModal: React.FC<AlertsModalProps> = React.memo(({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-3"
+      className={`${
+        isClosing ? 'animate-lv-fade-out pointer-events-none' : 'animate-lv-fade-in'
+      } fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-3`}
       onClick={onClose}
     >
       <div
-        className="w-full max-w-lg max-h-[calc(100dvh-20px)] flex flex-col rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#0F0F12] shadow-2xl overflow-y-auto"
+        className={`${
+          isClosing ? 'animate-lv-modal-out' : 'animate-lv-modal-in'
+        } w-full max-w-lg max-h-[calc(100dvh-20px)] flex flex-col rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#0F0F12] shadow-2xl overflow-y-auto`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}

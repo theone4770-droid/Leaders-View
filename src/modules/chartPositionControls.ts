@@ -174,3 +174,201 @@ export function hitTestPositionControls(
 export function getInstrumentDecimals(symbol: MarketSymbol): number {
   return INSTRUMENT_SPREAD_CONFIG[symbol].decimals;
 }
+
+export function computeProjectedPendingSlTpPnL(
+  symbol: MarketSymbol,
+  direction: 'BUY' | 'SELL',
+  lotSize: number,
+  execRefPrice: number,
+  targetPrice: number
+): number {
+  return computeClosedPnL(symbol, direction, lotSize, execRefPrice, targetPrice);
+}
+
+export function isPendingSlTpValid(
+  direction: 'BUY' | 'SELL',
+  execRefPrice: number,
+  target: 'SL' | 'TP',
+  price: number
+): { valid: boolean; reason?: string } {
+  if (!Number.isFinite(price) || price <= 0) {
+    return { valid: false, reason: 'Invalid price level.' };
+  }
+  if (target === 'SL') {
+    if (direction === 'BUY' && price >= execRefPrice) {
+      return { valid: false, reason: 'For BUY, SL must be below price' };
+    }
+    if (direction === 'SELL' && price <= execRefPrice) {
+      return { valid: false, reason: 'For SELL, SL must be above price' };
+    }
+  } else {
+    if (direction === 'BUY' && price <= execRefPrice) {
+      return { valid: false, reason: 'For BUY, TP must be above price' };
+    }
+    if (direction === 'SELL' && price >= execRefPrice) {
+      return { valid: false, reason: 'For SELL, TP must be below price' };
+    }
+  }
+  return { valid: true };
+}
+
+export type PendingDraftDragTarget = 'ENTRY' | 'LIMIT' | 'SL' | 'TP';
+
+export interface PendingDraftGeometry {
+  entryLineY: number;
+  entryPillRect: PositionLayoutRect;
+  limitLineY: number | null;
+  limitPillRect: PositionLayoutRect | null;
+  slHandleRect: PositionLayoutRect | null;
+  tpHandleRect: PositionLayoutRect | null;
+  slLineY: number | null;
+  slPillRect: PositionLayoutRect | null;
+  slClearRect: PositionLayoutRect | null;
+  tpLineY: number | null;
+  tpPillRect: PositionLayoutRect | null;
+  tpClearRect: PositionLayoutRect | null;
+}
+
+export type PendingDraftHitResult =
+  | { kind: 'entryLine'; onPill: boolean }
+  | { kind: 'limitLine'; onPill: boolean }
+  | { kind: 'slHandle' }
+  | { kind: 'tpHandle' }
+  | { kind: 'slLine'; onPill: boolean }
+  | { kind: 'tpLine'; onPill: boolean }
+  | { kind: 'clearSl' }
+  | { kind: 'clearTp' };
+
+export function hitTestPendingDraft(
+  x: number,
+  y: number,
+  geom: PendingDraftGeometry | null,
+  plotX: number,
+  plotWidth: number
+): PendingDraftHitResult | null {
+  if (!geom || x < plotX || x > plotX + plotWidth) return null;
+
+  if (pointInRect(x, y, geom.slClearRect, 5, 5)) return { kind: 'clearSl' };
+  if (pointInRect(x, y, geom.tpClearRect, 5, 5)) return { kind: 'clearTp' };
+  if (pointInRect(x, y, geom.slHandleRect, 4, 5)) return { kind: 'slHandle' };
+  if (pointInRect(x, y, geom.tpHandleRect, 4, 5)) return { kind: 'tpHandle' };
+
+  if (pointInRect(x, y, geom.slPillRect, 4, 5)) return { kind: 'slLine', onPill: true };
+  if (pointInRect(x, y, geom.tpPillRect, 4, 5)) return { kind: 'tpLine', onPill: true };
+  if (pointInRect(x, y, geom.limitPillRect, 4, 5)) return { kind: 'limitLine', onPill: true };
+  if (pointInRect(x, y, geom.entryPillRect, 4, 5)) return { kind: 'entryLine', onPill: true };
+
+  const LINE_TOLERANCE = 12;
+  if (geom.slLineY !== null && Math.abs(y - geom.slLineY) <= LINE_TOLERANCE) {
+    return { kind: 'slLine', onPill: false };
+  }
+  if (geom.tpLineY !== null && Math.abs(y - geom.tpLineY) <= LINE_TOLERANCE) {
+    return { kind: 'tpLine', onPill: false };
+  }
+  if (geom.limitLineY !== null && Math.abs(y - geom.limitLineY) <= LINE_TOLERANCE) {
+    return { kind: 'limitLine', onPill: false };
+  }
+  if (Math.abs(y - geom.entryLineY) <= LINE_TOLERANCE) {
+    return { kind: 'entryLine', onPill: false };
+  }
+
+  return null;
+}
+
+export type PendingOrderDragTarget = 'ENTRY' | 'LIMIT' | 'SL' | 'TP';
+
+export interface PendingOrderDragPreview {
+  orderId: string;
+  target: PendingOrderDragTarget;
+  price: number;
+}
+
+export interface PendingOrderChartGeometry {
+  orderId: string;
+  entryLineY: number;
+  entryPillRect: PositionLayoutRect;
+  limitLineY: number | null;
+  limitPillRect: PositionLayoutRect | null;
+  slHandleRect: PositionLayoutRect | null;
+  tpHandleRect: PositionLayoutRect | null;
+  slLineY: number | null;
+  slPillRect: PositionLayoutRect | null;
+  slClearRect: PositionLayoutRect | null;
+  tpLineY: number | null;
+  tpPillRect: PositionLayoutRect | null;
+  tpClearRect: PositionLayoutRect | null;
+}
+
+export type PendingOrderHitResult =
+  | { kind: 'entry'; orderId: string; onPill: boolean }
+  | { kind: 'limitLine'; orderId: string; onPill: boolean }
+  | { kind: 'slHandle'; orderId: string }
+  | { kind: 'tpHandle'; orderId: string }
+  | { kind: 'slLine'; orderId: string; onPill: boolean }
+  | { kind: 'tpLine'; orderId: string; onPill: boolean }
+  | { kind: 'clearSl'; orderId: string }
+  | { kind: 'clearTp'; orderId: string };
+
+export function hitTestPendingOrders(
+  x: number,
+  y: number,
+  geometries: PendingOrderChartGeometry[],
+  plotX: number,
+  plotWidth: number
+): PendingOrderHitResult | null {
+  if (x < plotX || x > plotX + plotWidth || geometries.length === 0) return null;
+
+  // 1. Highest priority: exact clear buttons and SL/TP drag handles
+  for (let i = geometries.length - 1; i >= 0; i--) {
+    const g = geometries[i];
+    if (pointInRect(x, y, g.slClearRect, 5, 5)) {
+      return { kind: 'clearSl', orderId: g.orderId };
+    }
+    if (pointInRect(x, y, g.tpClearRect, 5, 5)) {
+      return { kind: 'clearTp', orderId: g.orderId };
+    }
+    if (pointInRect(x, y, g.slHandleRect, 4, 5)) {
+      return { kind: 'slHandle', orderId: g.orderId };
+    }
+    if (pointInRect(x, y, g.tpHandleRect, 4, 5)) {
+      return { kind: 'tpHandle', orderId: g.orderId };
+    }
+  }
+
+  // 2. Pills for SL, TP, Limit, Entry
+  for (let i = geometries.length - 1; i >= 0; i--) {
+    const g = geometries[i];
+    if (pointInRect(x, y, g.slPillRect, 4, 5)) {
+      return { kind: 'slLine', orderId: g.orderId, onPill: true };
+    }
+    if (pointInRect(x, y, g.tpPillRect, 4, 5)) {
+      return { kind: 'tpLine', orderId: g.orderId, onPill: true };
+    }
+    if (pointInRect(x, y, g.limitPillRect, 4, 5)) {
+      return { kind: 'limitLine', orderId: g.orderId, onPill: true };
+    }
+    if (pointInRect(x, y, g.entryPillRect, 4, 5)) {
+      return { kind: 'entry', orderId: g.orderId, onPill: true };
+    }
+  }
+
+  // 3. Horizontal line proximity
+  const LINE_TOLERANCE = 11;
+  for (let i = geometries.length - 1; i >= 0; i--) {
+    const g = geometries[i];
+    if (g.slLineY !== null && Math.abs(y - g.slLineY) <= LINE_TOLERANCE) {
+      return { kind: 'slLine', orderId: g.orderId, onPill: false };
+    }
+    if (g.tpLineY !== null && Math.abs(y - g.tpLineY) <= LINE_TOLERANCE) {
+      return { kind: 'tpLine', orderId: g.orderId, onPill: false };
+    }
+    if (g.limitLineY !== null && Math.abs(y - g.limitLineY) <= LINE_TOLERANCE) {
+      return { kind: 'limitLine', orderId: g.orderId, onPill: false };
+    }
+    if (Math.abs(y - g.entryLineY) <= LINE_TOLERANCE) {
+      return { kind: 'entry', orderId: g.orderId, onPill: false };
+    }
+  }
+
+  return null;
+}

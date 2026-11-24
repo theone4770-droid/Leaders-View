@@ -4,6 +4,7 @@ import { DrawingObject, LineStyleType } from '../types/chart';
 import { TOOL_BY_ID } from '../modules/drawingCatalogue';
 import { loadPropBarPosition, savePropBarPosition } from '../modules/drawingStorage';
 import { FibSettingsModal } from './FibSettingsModal';
+import { useAnimatedPresence } from '../hooks/useAnimatedPresence';
 
 interface DrawingPropertiesBarProps {
   drawing: DrawingObject | null;
@@ -27,6 +28,13 @@ const TEXT_CAPABLE_TOOLS = new Set([
 
 export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.memo(
   ({ drawing, onUpdate, onDuplicate, onDelete, onClose }) => {
+    const { shouldRender, isClosing } = useAnimatedPresence(Boolean(drawing), 165);
+    const lastDrawingRef = useRef<DrawingObject | null>(drawing);
+    if (drawing) {
+      lastDrawingRef.current = drawing;
+    }
+    const activeDrawing = drawing ?? lastDrawingRef.current;
+
     const barRef = useRef<HTMLDivElement | null>(null);
     const [pos, setPos] = useState<{ x: number; y: number } | null>(() => loadPropBarPosition());
     const posRef = useRef<{ x: number; y: number } | null>(pos);
@@ -67,11 +75,18 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
         y: Math.max(8, Math.min(Math.max(8, window.innerHeight - barH - 56), y)),
       });
 
+      const applyDragDelta = (nextPos: { x: number; y: number }) => {
+        const el = barRef.current;
+        if (!el) return;
+        const d = draggingRef.current;
+        el.style.transform = `translate3d(${nextPos.x - d.origX}px, ${nextPos.y - d.origY}px, 0)`;
+      };
+
       const applyDomPos = (nextPos: { x: number; y: number }) => {
         const el = barRef.current;
         if (!el) return;
         el.style.bottom = 'auto';
-        el.style.transform = 'translateZ(0)';
+        el.style.transform = '';
         el.style.left = `${nextPos.x}px`;
         el.style.top = `${nextPos.y}px`;
       };
@@ -88,7 +103,7 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
           d.rafId = requestAnimationFrame(() => {
             d.rafId = null;
             if (d.pendingPos) {
-              applyDomPos(d.pendingPos);
+              applyDragDelta(d.pendingPos);
               d.pendingPos = null;
             }
           });
@@ -104,10 +119,11 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
           d.rafId = null;
         }
         if (d.pendingPos) {
-          applyDomPos(d.pendingPos);
+          posRef.current = d.pendingPos;
           d.pendingPos = null;
         }
         if (posRef.current) {
+          applyDomPos(posRef.current);
           setPos(posRef.current);
           savePropBarPosition(posRef.current);
         }
@@ -139,10 +155,10 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
       };
     }, []);
 
-    if (!drawing) return null;
+    if (!shouldRender || !activeDrawing) return null;
 
-    const toolDef = TOOL_BY_ID[drawing.toolId];
-    const supportsText = TEXT_CAPABLE_TOOLS.has(drawing.toolId);
+    const toolDef = TOOL_BY_ID[activeDrawing.toolId];
+    const supportsText = TEXT_CAPABLE_TOOLS.has(activeDrawing.toolId);
 
     const startDrag = (e: React.PointerEvent) => {
       const target = e.target as HTMLElement | null;
@@ -159,6 +175,12 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
       const rect = el?.getBoundingClientRect();
       const origX = rect ? rect.left : Math.max(8, (window.innerWidth - 400) / 2);
       const origY = rect ? rect.top : Math.max(8, window.innerHeight - 106);
+      if (el) {
+        el.style.bottom = 'auto';
+        el.style.left = `${origX}px`;
+        el.style.top = `${origY}px`;
+        el.style.transform = 'translate3d(0px, 0px, 0)';
+      }
       draggingRef.current = {
         active: true,
         startX: e.clientX,
@@ -174,6 +196,12 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
 
     const resetPosition = () => {
       posRef.current = null;
+      if (barRef.current) {
+        barRef.current.style.left = '';
+        barRef.current.style.top = '';
+        barRef.current.style.bottom = '';
+        barRef.current.style.transform = '';
+      }
       setPos(null);
       savePropBarPosition(null);
     };
@@ -189,7 +217,9 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
           style={style}
           onPointerDown={startDrag}
           data-testid="drawing-properties-bar"
-          className="lv-gpu-layer fixed z-30 flex items-center w-max max-w-[calc(100vw-16px)] rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF]/96 dark:bg-[#101013]/96 px-2 py-1.5 shadow-2xl select-none"
+          className={`lv-gpu-layer ${
+            isClosing ? 'animate-lv-fade-out pointer-events-none' : 'animate-lv-fade-in'
+          } fixed z-30 flex items-center w-max max-w-[calc(100vw-16px)] rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF]/96 dark:bg-[#101013]/96 px-2 py-1.5 shadow-2xl select-none`}
         >
           {/* Horizontally scrollable tool style & properties strip */}
           <div className="flex flex-nowrap items-center gap-1.5 min-w-0 flex-1 overflow-x-auto no-scrollbar whitespace-nowrap pr-1.5">
@@ -219,10 +249,10 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
                 <button
                   key={hex}
                   type="button"
-                  onClick={() => onUpdate({ style: { ...drawing.style, color: hex } })}
+                  onClick={() => onUpdate({ style: { ...activeDrawing.style, color: hex } })}
                   aria-label={`Set color ${hex}`}
                   className={`h-4.5 w-4.5 shrink-0 rounded-full border transition-transform cursor-pointer ${
-                    drawing.style.color.toLowerCase() === hex.toLowerCase()
+                    activeDrawing.style.color.toLowerCase() === hex.toLowerCase()
                       ? 'scale-110 border-[#141311] dark:border-[#FFFFFF] ring-2 ring-[#141311]/35 dark:ring-[#FFFFFF]/40'
                       : 'border-black/25 dark:border-white/25'
                   }`}
@@ -231,8 +261,8 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
               ))}
               <input
                 type="color"
-                value={drawing.style.color}
-                onChange={(e) => onUpdate({ style: { ...drawing.style, color: e.target.value } })}
+                value={activeDrawing.style.color}
+                onChange={(e) => onUpdate({ style: { ...activeDrawing.style, color: e.target.value } })}
                 aria-label="Custom color"
                 className="h-5 w-5 shrink-0 rounded cursor-pointer border border-[#141311]/35 dark:border-[#FFFFFF]/40 bg-transparent p-0"
               />
@@ -246,9 +276,9 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
                 <button
                   key={w}
                   type="button"
-                  onClick={() => onUpdate({ style: { ...drawing.style, lineWidth: w } })}
+                  onClick={() => onUpdate({ style: { ...activeDrawing.style, lineWidth: w } })}
                   className={`h-6 w-6 shrink-0 rounded text-[11px] font-mono-num font-bold border cursor-pointer ${
-                    drawing.style.lineWidth === w
+                    activeDrawing.style.lineWidth === w
                       ? 'border-[#141311] dark:border-[#FFFFFF] bg-[#141311]/15 dark:bg-[#FFFFFF]/20 text-[#141311] dark:text-[#FFFFFF]'
                       : 'border-transparent text-[#625D52] dark:text-[#9A9892] hover:border-[#141311]/40 dark:hover:border-[#FFFFFF]/40'
                   }`}
@@ -264,9 +294,9 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
                 <button
                   key={st}
                   type="button"
-                  onClick={() => onUpdate({ style: { ...drawing.style, lineStyle: st } })}
+                  onClick={() => onUpdate({ style: { ...activeDrawing.style, lineStyle: st } })}
                   className={`px-2 h-6 shrink-0 rounded text-[10px] font-bold tracking-wider uppercase border cursor-pointer ${
-                    drawing.style.lineStyle === st
+                    activeDrawing.style.lineStyle === st
                       ? 'border-[#141311] dark:border-[#FFFFFF] bg-[#141311]/15 dark:bg-[#FFFFFF]/20 text-[#141311] dark:text-[#FFFFFF]'
                       : 'border-transparent text-[#625D52] dark:text-[#9A9892] hover:border-[#141311]/40 dark:hover:border-[#FFFFFF]/40'
                   }`}
@@ -278,7 +308,7 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
 
             {/* Opacity */}
             {(() => {
-              const opacityPct = Math.round((drawing.style.opacity ?? 1) * 100);
+              const opacityPct = Math.round((activeDrawing.style.opacity ?? 1) * 100);
               const sliderRatio = Math.max(0, Math.min(1, (opacityPct - 15) / 85));
               return (
                 <label className="flex items-center gap-1.5 shrink-0 text-[10px] font-mono-num text-[#141311] dark:text-[#FFFFFF]">
@@ -297,7 +327,7 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
                       max={100}
                       value={opacityPct}
                       onChange={(e) =>
-                        onUpdate({ style: { ...drawing.style, opacity: Number(e.target.value) / 100 } })
+                        onUpdate({ style: { ...activeDrawing.style, opacity: Number(e.target.value) / 100 } })
                       }
                       aria-label="Drawing Opacity"
                       className="lv-thin-range absolute inset-0 h-full w-full cursor-pointer opacity-0"
@@ -311,7 +341,7 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
             {supportsText && (
               <input
                 type="text"
-                value={drawing.text ?? ''}
+                value={activeDrawing.text ?? ''}
                 onChange={(e) => onUpdate({ text: e.target.value })}
                 placeholder="Annotation text..."
                 aria-label="Edit drawing text"
@@ -322,7 +352,7 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
             <div className="h-4 w-px shrink-0 bg-[#141311]/20 dark:bg-[#FFFFFF]/20" />
 
             {/* TradingView-style Settings button for Fibonacci Retracement */}
-            {drawing.toolId === 'fib_retracement' && (
+            {activeDrawing.toolId === 'fib_retracement' && (
               <button
                 type="button"
                 onClick={() => setIsFibSettingsOpen(true)}
@@ -373,8 +403,8 @@ export const DrawingPropertiesBar: React.FC<DrawingPropertiesBarProps> = React.m
         </div>
 
         <FibSettingsModal
-          open={isFibSettingsOpen}
-          drawing={drawing}
+          open={isFibSettingsOpen && Boolean(drawing)}
+          drawing={activeDrawing}
           onUpdate={onUpdate}
           onClose={() => setIsFibSettingsOpen(false)}
         />

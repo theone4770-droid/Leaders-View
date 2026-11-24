@@ -173,8 +173,214 @@
   height: 11px;
 }
 
+/* Smooth GPU compositor enter/exit animations for screens, sheets, modals, and floating panels */
+@keyframes lv-fade-in {
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes lv-fade-out {
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes lv-sheet-up {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 28px, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes lv-sheet-down {
+  0% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(0, 28px, 0);
+  }
+}
+
+@keyframes lv-screen-in {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 14px, 0) scale(0.992);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes lv-screen-out {
+  0% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(0, 14px, 0) scale(0.992);
+  }
+}
+
+@keyframes lv-modal-in {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0) scale(0.965);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes lv-modal-out {
+  0% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0) scale(0.965);
+  }
+}
+
+@keyframes lv-panel-in {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -6px, 0) scale(0.975);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes lv-panel-out {
+  0% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(0, -6px, 0) scale(0.975);
+  }
+}
+
+@keyframes lv-quickbar-in {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -8px, 0) scale(0.95);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes lv-quickbar-out {
+  0% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(0, -8px, 0) scale(0.95);
+  }
+}
+
+.animate-lv-fade-in {
+  animation: lv-fade-in 0.16s ease-out both;
+  will-change: opacity;
+}
+
+.animate-lv-fade-out {
+  animation: lv-fade-out 0.14s ease-in both;
+  will-change: opacity;
+}
+
+.animate-lv-sheet-up {
+  animation: lv-sheet-up 0.22s cubic-bezier(0.22, 1, 0.36, 1) both;
+  will-change: transform, opacity;
+}
+
+.animate-lv-sheet-down {
+  animation: lv-sheet-down 0.15s cubic-bezier(0.4, 0, 1, 1) both;
+  will-change: transform, opacity;
+}
+
+.animate-lv-screen-in {
+  animation: lv-screen-in 0.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+  will-change: transform, opacity;
+}
+
+.animate-lv-screen-out {
+  animation: lv-screen-out 0.15s cubic-bezier(0.4, 0, 1, 1) both;
+  will-change: transform, opacity;
+}
+
+.animate-lv-modal-in {
+  animation: lv-modal-in 0.18s cubic-bezier(0.22, 1, 0.36, 1) both;
+  will-change: transform, opacity;
+}
+
+.animate-lv-modal-out {
+  animation: lv-modal-out 0.14s cubic-bezier(0.4, 0, 1, 1) both;
+  will-change: transform, opacity;
+}
+
+.animate-lv-panel-in {
+  animation: lv-panel-in 0.17s cubic-bezier(0.22, 1, 0.36, 1) both;
+  will-change: transform, opacity;
+}
+
+.animate-lv-panel-out {
+  animation: lv-panel-out 0.13s cubic-bezier(0.4, 0, 1, 1) both;
+  will-change: transform, opacity;
+}
+
+.animate-lv-quickbar-in {
+  animation: lv-quickbar-in 0.19s cubic-bezier(0.22, 1, 0.36, 1) both;
+  will-change: transform, opacity;
+}
+
+.animate-lv-quickbar-out {
+  animation: lv-quickbar-out 0.14s cubic-bezier(0.4, 0, 1, 1) both;
+  will-change: transform, opacity;
+}
+
+.lv-scroll-smooth {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .animate-lv-shimmer {
+  .animate-lv-shimmer,
+  .animate-lv-fade-in,
+  .animate-lv-fade-out,
+  .animate-lv-sheet-up,
+  .animate-lv-sheet-down,
+  .animate-lv-screen-in,
+  .animate-lv-screen-out,
+  .animate-lv-modal-in,
+  .animate-lv-modal-out,
+  .animate-lv-panel-in,
+  .animate-lv-panel-out,
+  .animate-lv-quickbar-in,
+  .animate-lv-quickbar-out {
     animation: none;
   }
 }

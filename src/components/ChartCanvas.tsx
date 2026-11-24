@@ -16,17 +16,29 @@ import {
   MarketBidAskQuote,
   OpenPosition,
   PendingOrder,
+  PendingOrderDraft,
 } from '../types/trading';
 import { renderBaseChart } from '../modules/chartEngine';
 import {
+  computeProjectedPendingSlTpPnL,
   computeProjectedSlTpPnL,
   formatSignedUSD,
   getReferenceMarketPriceForSlTp,
+  hitTestPendingDraft,
+  hitTestPendingOrders,
   hitTestPositionControls,
+  PendingDraftDragTarget,
+  PendingDraftGeometry,
+  PendingDraftHitResult,
+  PendingOrderChartGeometry,
+  PendingOrderDragPreview,
+  PendingOrderDragTarget,
+  PendingOrderHitResult,
   PositionChartGeometry,
   PositionDragPreview,
   PositionHitResult,
 } from '../modules/chartPositionControls';
+import { getDirectionForPendingType } from '../modules/tradingEngine';
 import { INSTRUMENT_SPREAD_CONFIG, roundToInstrument } from '../modules/spreadEngine';
 import {
   applyFibSnapToAttachedRectangles,
@@ -124,8 +136,17 @@ interface ChartCanvasProps {
   quote?: MarketBidAskQuote | null;
   openPositions?: OpenPosition[];
   pendingOrders?: PendingOrder[];
+  pendingOrderDraft?: PendingOrderDraft | null;
+  onUpdatePendingOrderDraft?: (next: PendingOrderDraft) => void;
   onModifyPositionSlTp?: (params: {
     positionId: string;
+    sl: number | null;
+    tp: number | null;
+  }) => { ok: boolean; error?: string };
+  onModifyPendingOrder?: (params: {
+    orderId: string;
+    entryPrice: number;
+    limitPrice: number | null;
     sl: number | null;
     tp: number | null;
   }) => { ok: boolean; error?: string };
@@ -166,7 +187,10 @@ export const ChartCanvas = React.memo(
         quote = null,
         openPositions = [],
         pendingOrders = [],
+        pendingOrderDraft = null,
+        onUpdatePendingOrderDraft,
         onModifyPositionSlTp,
+        onModifyPendingOrder,
         hasQuickTradeBar = false,
       },
       ref
@@ -222,11 +246,24 @@ export const ChartCanvas = React.memo(
     const replayHoverIdxRef = useRef<number | null>(null);
     const hoveredHitRef = useRef<{ drawingId: string; handleIndex: number } | null>(null);
     const hoveredPositionHitRef = useRef<PositionHitResult | null>(null);
+    const hoveredPendingHitRef = useRef<PendingDraftHitResult | null>(null);
+    const hoveredPlacedPendingHitRef = useRef<PendingOrderHitResult | null>(null);
     const selectedPositionIdRef = useRef<string | null>(null);
     const positionDragPreviewRef = useRef<PositionDragPreview | null>(null);
     const positionGeometriesRef = useRef<PositionChartGeometry[]>([]);
+    const selectedPendingOrderIdRef = useRef<string | null>(null);
+    const pendingOrderDragPreviewRef = useRef<PendingOrderDragPreview | null>(null);
+    const pendingOrderGeometriesRef = useRef<PendingOrderChartGeometry[]>([]);
+    const pendingOrderDraftRef = useRef<PendingOrderDraft | null>(pendingOrderDraft);
+    const pendingDraftGeometryRef = useRef<PendingDraftGeometry | null>(null);
+    const pendingDraftDragTargetRef = useRef<PendingDraftDragTarget | null>(null);
+    const lastPendingDraftSyncRef = useRef<number>(0);
+    const onUpdatePendingOrderDraftRef = useRef(onUpdatePendingOrderDraft);
+    onUpdatePendingOrderDraftRef.current = onUpdatePendingOrderDraft;
     const onModifyPositionSlTpRef = useRef(onModifyPositionSlTp);
     onModifyPositionSlTpRef.current = onModifyPositionSlTp;
+    const onModifyPendingOrderRef = useRef(onModifyPendingOrder);
+    onModifyPendingOrderRef.current = onModifyPendingOrder;
     const [positionFeedback, setPositionFeedback] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
     const positionFeedbackTimerRef = useRef<number | null>(null);
     const longPressTimerRef = useRef<number | null>(null);
@@ -277,10 +314,29 @@ export const ChartCanvas = React.memo(
           origSl: number | null;
           origTp: number | null;
         }
+      | {
+          kind: 'dragPendingDraft';
+          target: PendingDraftDragTarget;
+        }
+      | {
+          kind: 'pendingOrderEntryPress';
+          orderId: string;
+          startX: number;
+          startY: number;
+          wasAlreadySelected: boolean;
+        }
+      | {
+          kind: 'dragPendingOrder';
+          orderId: string;
+          target: PendingOrderDragTarget;
+        }
     >({ kind: 'none' });
 
     if (dragModeRef.current.kind !== 'moveDrawing' && dragModeRef.current.kind !== 'resizeHandle') {
       drawingsRef.current = drawings;
+    }
+    if (dragModeRef.current.kind !== 'dragPendingDraft') {
+      pendingOrderDraftRef.current = pendingOrderDraft;
     }
     selectedIdRef.current = selectedDrawingId;
     activeToolRef.current = activeToolId;
@@ -648,11 +704,16 @@ export const ChartCanvas = React.memo(
               : 'pointer';
         return;
       }
-      if (mode === 'priceScale' || mode === 'dragPositionSlTp') {
+      if (
+        mode === 'priceScale' ||
+        mode === 'dragPositionSlTp' ||
+        mode === 'dragPendingDraft' ||
+        mode === 'dragPendingOrder'
+      ) {
         canvas.style.cursor = 'ns-resize';
         return;
       }
-      if (mode === 'positionEntryPress') {
+      if (mode === 'positionEntryPress' || mode === 'pendingOrderEntryPress') {
         canvas.style.cursor = 'pointer';
         return;
       }
@@ -663,6 +724,18 @@ export const ChartCanvas = React.memo(
       }
       if (tool && !tool.isCursorTool) {
         canvas.style.cursor = 'crosshair';
+        return;
+      }
+      if (hoveredPendingHitRef.current) {
+        const pk = hoveredPendingHitRef.current.kind;
+        canvas.style.cursor =
+          pk === 'clearSl' || pk === 'clearTp' ? 'pointer' : 'ns-resize';
+        return;
+      }
+      if (hoveredPlacedPendingHitRef.current) {
+        const pk = hoveredPlacedPendingHitRef.current.kind;
+        canvas.style.cursor =
+          pk === 'clearSl' || pk === 'clearTp' ? 'pointer' : 'ns-resize';
         return;
       }
       if (hoveredPositionHitRef.current) {
@@ -809,6 +882,7 @@ export const ChartCanvas = React.memo(
       quote,
       openPositions,
       pendingOrders,
+      pendingOrderDraft,
       isFullScreen,
       requestRedraw,
     ]);
@@ -1168,13 +1242,19 @@ export const ChartCanvas = React.memo(
             const bctx = baseCtxRef.current;
             if (bctx) {
               const baseQ = quoteRef.current;
+              const effectiveLastClose =
+                liveCandleOverride
+                  ? liveCandleOverride.close
+                  : visCandles.length > 0
+                    ? visCandles[visCandles.length - 1].close
+                    : null;
               const frameQuote =
-                baseQ && replayRef.current.mode === 'OFF' && liveCandleOverride
+                baseQ && replayRef.current.mode === 'OFF' && effectiveLastClose !== null
                   ? {
                       ...baseQ,
-                      bid: liveCandleOverride.close,
-                      ask: liveCandleOverride.close + baseQ.spread,
-                      mid: liveCandleOverride.close + baseQ.spread / 2,
+                      bid: effectiveLastClose,
+                      ask: effectiveLastClose + baseQ.spread,
+                      mid: effectiveLastClose + baseQ.spread / 2,
                     }
                   : baseQ;
               bctx.save();
@@ -1199,9 +1279,15 @@ export const ChartCanvas = React.memo(
                   pendingOrders: pendingOrdersRef.current,
                   selectedPositionId: selectedPositionIdRef.current,
                   positionDragPreview: positionDragPreviewRef.current,
+                  selectedPendingOrderId: selectedPendingOrderIdRef.current,
+                  pendingOrderDragPreview: pendingOrderDragPreviewRef.current,
+                  pendingOrderDraft: pendingOrderDraftRef.current,
+                  pendingDraftDragTarget: pendingDraftDragTargetRef.current,
                   isFullScreen: fullScreenRef.current,
                 });
                 positionGeometriesRef.current = baseMetrics.positionGeometries;
+                pendingOrderGeometriesRef.current = baseMetrics.pendingOrderGeometries;
+                pendingDraftGeometryRef.current = baseMetrics.pendingDraftGeometry;
               } finally {
                 bctx.restore();
               }
@@ -1996,6 +2082,60 @@ export const ChartCanvas = React.memo(
         }
       }
 
+      // 5b. Cursor mode: Hit-test active Pending Order Draft lines/handles first
+      if (replayRef.current.mode === 'OFF' && pendingOrderDraftRef.current) {
+        const draft = pendingOrderDraftRef.current;
+        const pendHit = hitTestPendingDraft(
+          x,
+          y,
+          pendingDraftGeometryRef.current,
+          plot.x,
+          plot.width
+        );
+        if (pendHit) {
+          const cfg = INSTRUMENT_SPREAD_CONFIG[draft.symbol];
+          const activeRange = getActivePriceRange(vis, plot);
+          const clampedY = Math.max(plot.y, Math.min(plot.y + plot.height, y));
+          const pointerPrice = roundToInstrument(
+            yToPrice(clampedY, activeRange, plot),
+            cfg.decimals
+          );
+
+          if (pendHit.kind === 'clearSl') {
+            const updated = { ...draft, sl: null };
+            pendingOrderDraftRef.current = updated;
+            onUpdatePendingOrderDraftRef.current?.(updated);
+            requestRedraw(true, true);
+            return;
+          }
+          if (pendHit.kind === 'clearTp') {
+            const updated = { ...draft, tp: null };
+            pendingOrderDraftRef.current = updated;
+            onUpdatePendingOrderDraftRef.current?.(updated);
+            requestRedraw(true, true);
+            return;
+          }
+
+          let target: PendingDraftDragTarget = 'ENTRY';
+          if (pendHit.kind === 'limitLine') target = 'LIMIT';
+          else if (pendHit.kind === 'slHandle' || pendHit.kind === 'slLine') target = 'SL';
+          else if (pendHit.kind === 'tpHandle' || pendHit.kind === 'tpLine') target = 'TP';
+
+          hoveredPendingHitRef.current = pendHit;
+          pendingDraftDragTargetRef.current = target;
+          dragModeRef.current = { kind: 'dragPendingDraft', target };
+
+          if (target === 'SL' && draft.sl === null) {
+            pendingOrderDraftRef.current = { ...draft, sl: pointerPrice };
+          } else if (target === 'TP' && draft.tp === null) {
+            pendingOrderDraftRef.current = { ...draft, tp: pointerPrice };
+          }
+          syncCanvasCursor(x, y);
+          requestRedraw(true, true);
+          return;
+        }
+      }
+
       // 6a. Cursor mode: Hit-test open position lines & SL/TP drag handles first
       if (replayRef.current.mode === 'OFF') {
         const posHit = hitTestPositionControls(
@@ -2070,10 +2210,108 @@ export const ChartCanvas = React.memo(
             if (posHit.kind === 'entry') {
               const wasAlreadySelected = selectedPositionIdRef.current === targetPos.id;
               selectedPositionIdRef.current = targetPos.id;
+              selectedPendingOrderIdRef.current = null;
               hoveredPositionHitRef.current = posHit;
               dragModeRef.current = {
                 kind: 'positionEntryPress',
                 positionId: targetPos.id,
+                startX: x,
+                startY: y,
+                wasAlreadySelected,
+              };
+              syncCanvasCursor(x, y);
+              requestRedraw(true, true);
+              return;
+            }
+          }
+        }
+
+        // 6a-2. Hit-test active placed Pending Orders & drag-style SL / TP / Entry / Limit handles
+        const placedPendHit = hitTestPendingOrders(
+          x,
+          y,
+          pendingOrderGeometriesRef.current,
+          plot.x,
+          plot.width
+        );
+        if (placedPendHit) {
+          const targetOrd = pendingOrdersRef.current.find((o) => o.id === placedPendHit.orderId);
+          if (targetOrd) {
+            const cfg = INSTRUMENT_SPREAD_CONFIG[targetOrd.symbol];
+            const activeRange = getActivePriceRange(vis, plot);
+            const clampedY = Math.max(plot.y, Math.min(plot.y + plot.height, y));
+            const pointerPrice = roundToInstrument(
+              yToPrice(clampedY, activeRange, plot),
+              cfg.decimals
+            );
+
+            if (placedPendHit.kind === 'clearSl' || placedPendHit.kind === 'clearTp') {
+              const res = onModifyPendingOrderRef.current?.({
+                orderId: targetOrd.id,
+                entryPrice: targetOrd.entryPrice,
+                limitPrice: targetOrd.limitPrice,
+                sl: placedPendHit.kind === 'clearSl' ? null : targetOrd.sl,
+                tp: placedPendHit.kind === 'clearTp' ? null : targetOrd.tp,
+              });
+              if (res && !res.ok) {
+                showPositionFeedback('err', res.error || 'Unable to clear pending level.');
+              } else {
+                showPositionFeedback(
+                  'ok',
+                  placedPendHit.kind === 'clearSl' ? 'Pending SL cleared' : 'Pending TP cleared'
+                );
+              }
+              requestRedraw(true, true);
+              return;
+            }
+
+            if (
+              placedPendHit.kind === 'slHandle' ||
+              placedPendHit.kind === 'tpHandle' ||
+              placedPendHit.kind === 'slLine' ||
+              placedPendHit.kind === 'tpLine' ||
+              placedPendHit.kind === 'limitLine'
+            ) {
+              const target: PendingOrderDragTarget =
+                placedPendHit.kind === 'limitLine'
+                  ? 'LIMIT'
+                  : placedPendHit.kind === 'slHandle' || placedPendHit.kind === 'slLine'
+                    ? 'SL'
+                    : 'TP';
+              selectedPendingOrderIdRef.current = targetOrd.id;
+              selectedPositionIdRef.current = null;
+              hoveredPlacedPendingHitRef.current = placedPendHit;
+              dragModeRef.current = {
+                kind: 'dragPendingOrder',
+                orderId: targetOrd.id,
+                target,
+              };
+              const initPrice =
+                target === 'LIMIT' && targetOrd.limitPrice !== null
+                  ? targetOrd.limitPrice
+                  : target === 'SL' && placedPendHit.kind === 'slLine' && targetOrd.sl !== null
+                    ? targetOrd.sl
+                    : target === 'TP' && placedPendHit.kind === 'tpLine' && targetOrd.tp !== null
+                      ? targetOrd.tp
+                      : pointerPrice;
+              pendingOrderDragPreviewRef.current = {
+                orderId: targetOrd.id,
+                target,
+                price: initPrice,
+              };
+              syncCanvasCursor(x, y);
+              requestRedraw(true, true);
+              return;
+            }
+
+            if (placedPendHit.kind === 'entry') {
+              const wasAlreadySelected = selectedPendingOrderIdRef.current === targetOrd.id;
+              selectedPendingOrderIdRef.current = targetOrd.id;
+              selectedPositionIdRef.current = null;
+              hoveredPlacedPendingHitRef.current = placedPendHit;
+              dragModeRef.current = {
+                kind: 'pendingOrderEntryPress',
+                orderId: targetOrd.id,
                 startX: x,
                 startY: y,
                 wasAlreadySelected,
@@ -2143,8 +2381,9 @@ export const ChartCanvas = React.memo(
 
       // 8. Otherwise deselect and pan chart smoothly (zero-jump horizontal & vertical drag; touch long-press opens 24h free crosshair)
       hoveredHitRef.current = null;
-      if (selectedPositionIdRef.current !== null) {
+      if (selectedPositionIdRef.current !== null || selectedPendingOrderIdRef.current !== null) {
         selectedPositionIdRef.current = null;
+        selectedPendingOrderIdRef.current = null;
         requestRedraw(true, true);
       }
       if (selectedIdRef.current) {
@@ -2240,6 +2479,81 @@ export const ChartCanvas = React.memo(
             syncCanvasCursor(x, y);
             requestRedraw(true, true);
           }
+        }
+        return;
+      }
+
+      if (mode.kind === 'pendingOrderEntryPress') {
+        const dy = y - mode.startY;
+        if (Math.abs(dy) >= 5) {
+          const targetOrd = pendingOrdersRef.current.find((o) => o.id === mode.orderId);
+          if (targetOrd) {
+            const cfg = INSTRUMENT_SPREAD_CONFIG[targetOrd.symbol];
+            const range = getActivePriceRange(vis, plot);
+            const clampedY = Math.max(plot.y, Math.min(plot.y + plot.height, y));
+            const dragPrice = roundToInstrument(yToPrice(clampedY, range, plot), cfg.decimals);
+            selectedPendingOrderIdRef.current = targetOrd.id;
+            dragModeRef.current = {
+              kind: 'dragPendingOrder',
+              orderId: targetOrd.id,
+              target: 'ENTRY',
+            };
+            pendingOrderDragPreviewRef.current = {
+              orderId: targetOrd.id,
+              target: 'ENTRY',
+              price: dragPrice,
+            };
+            crosshairRef.current.y = clampedY;
+            crosshairRef.current.price = dragPrice;
+            syncCanvasCursor(x, y);
+            requestRedraw(true, true);
+          }
+        }
+        return;
+      }
+
+      if (mode.kind === 'dragPendingOrder') {
+        const targetOrd = pendingOrdersRef.current.find((o) => o.id === mode.orderId);
+        if (targetOrd) {
+          const cfg = INSTRUMENT_SPREAD_CONFIG[targetOrd.symbol];
+          const range = getActivePriceRange(vis, plot);
+          const clampedY = Math.max(plot.y, Math.min(plot.y + plot.height, y));
+          const dragPrice = roundToInstrument(yToPrice(clampedY, range, plot), cfg.decimals);
+          pendingOrderDragPreviewRef.current = {
+            orderId: mode.orderId,
+            target: mode.target,
+            price: dragPrice,
+          };
+          crosshairRef.current.y = clampedY;
+          crosshairRef.current.price = dragPrice;
+          requestRedraw(true, true);
+        }
+        return;
+      }
+
+      if (mode.kind === 'dragPendingDraft') {
+        const draft = pendingOrderDraftRef.current;
+        if (draft) {
+          const cfg = INSTRUMENT_SPREAD_CONFIG[draft.symbol];
+          const range = getActivePriceRange(vis, plot);
+          const clampedY = Math.max(plot.y, Math.min(plot.y + plot.height, y));
+          const dragPrice = roundToInstrument(yToPrice(clampedY, range, plot), cfg.decimals);
+          const nextDraft: PendingOrderDraft = {
+            ...draft,
+            ...(mode.target === 'ENTRY' ? { entryPrice: dragPrice } : {}),
+            ...(mode.target === 'LIMIT' ? { limitPrice: dragPrice } : {}),
+            ...(mode.target === 'SL' ? { sl: dragPrice } : {}),
+            ...(mode.target === 'TP' ? { tp: dragPrice } : {}),
+          };
+          pendingOrderDraftRef.current = nextDraft;
+          crosshairRef.current.y = clampedY;
+          crosshairRef.current.price = dragPrice;
+          const nowTs = performance.now();
+          if (nowTs - lastPendingDraftSyncRef.current > 40) {
+            lastPendingDraftSyncRef.current = nowTs;
+            onUpdatePendingOrderDraftRef.current?.(nextDraft);
+          }
+          requestRedraw(true, true);
         }
         return;
       }
@@ -2776,6 +3090,16 @@ export const ChartCanvas = React.memo(
 
       if (canHoverDrawings) {
         if (replayRef.current.mode === 'OFF' && (!tool || tool.isCursorTool)) {
+          hoveredPendingHitRef.current = pendingOrderDraftRef.current
+            ? hitTestPendingDraft(x, y, pendingDraftGeometryRef.current, plot.x, plot.width)
+            : null;
+          hoveredPlacedPendingHitRef.current = hitTestPendingOrders(
+            x,
+            y,
+            pendingOrderGeometriesRef.current,
+            plot.x,
+            plot.width
+          );
           hoveredPositionHitRef.current = hitTestPositionControls(
             x,
             y,
@@ -2784,6 +3108,8 @@ export const ChartCanvas = React.memo(
             plot.width
           );
         } else {
+          hoveredPendingHitRef.current = null;
+          hoveredPlacedPendingHitRef.current = null;
           hoveredPositionHitRef.current = null;
         }
         const priceRange = computePriceRange(vis, viewportRef.current, plot);
@@ -2804,6 +3130,8 @@ export const ChartCanvas = React.memo(
           requestRedraw(false, true);
         }
       } else {
+        hoveredPendingHitRef.current = null;
+        hoveredPlacedPendingHitRef.current = null;
         hoveredPositionHitRef.current = null;
         if (hoveredHitRef.current !== null) {
           hoveredHitRef.current = null;
@@ -2849,6 +3177,99 @@ export const ChartCanvas = React.memo(
       const mode = dragModeRef.current;
       dragModeRef.current = { kind: 'none' };
 
+      if (mode.kind === 'dragPendingDraft') {
+        pendingDraftDragTargetRef.current = null;
+        const draft = pendingOrderDraftRef.current;
+        if (draft) {
+          onUpdatePendingOrderDraftRef.current?.(draft);
+          if (mode.target === 'SL' || mode.target === 'TP') {
+            const val = mode.target === 'SL' ? draft.sl : draft.tp;
+            if (val !== null) {
+              const dec = INSTRUMENT_SPREAD_CONFIG[draft.symbol].decimals;
+              const dir = getDirectionForPendingType(draft.orderType);
+              const execRef = draft.limitPrice ?? draft.entryPrice;
+              const proj = computeProjectedPendingSlTpPnL(
+                draft.symbol,
+                dir,
+                draft.lotSize,
+                execRef,
+                val
+              );
+              showPositionFeedback(
+                'ok',
+                `${mode.target} ${formatPrice(val, dec)} · ${formatSignedUSD(proj)}`
+              );
+            }
+          }
+        }
+        if (!freeCrosshairRef.current) {
+          crosshairRef.current.visible = false;
+        }
+        requestRedraw(true, true);
+        syncCanvasCursor();
+        return;
+      }
+
+      if (mode.kind === 'pendingOrderEntryPress') {
+        selectedPendingOrderIdRef.current = mode.wasAlreadySelected ? null : mode.orderId;
+        if (!freeCrosshairRef.current) {
+          crosshairRef.current.visible = false;
+        }
+        requestRedraw(true, true);
+        syncCanvasCursor();
+        return;
+      }
+
+      if (mode.kind === 'dragPendingOrder') {
+        const preview = pendingOrderDragPreviewRef.current;
+        pendingOrderDragPreviewRef.current = null;
+        const targetOrd = pendingOrdersRef.current.find((o) => o.id === mode.orderId);
+        if (preview && targetOrd && onModifyPendingOrderRef.current) {
+          const nextEntry = preview.target === 'ENTRY' ? preview.price : targetOrd.entryPrice;
+          const nextLimit = preview.target === 'LIMIT' ? preview.price : targetOrd.limitPrice;
+          const nextSl = preview.target === 'SL' ? preview.price : targetOrd.sl;
+          const nextTp = preview.target === 'TP' ? preview.price : targetOrd.tp;
+          const res = onModifyPendingOrderRef.current({
+            orderId: targetOrd.id,
+            entryPrice: nextEntry,
+            limitPrice: nextLimit,
+            sl: nextSl,
+            tp: nextTp,
+          });
+          if (!res.ok) {
+            showPositionFeedback('err', res.error || 'Invalid pending order price.');
+          } else {
+            const dec = INSTRUMENT_SPREAD_CONFIG[targetOrd.symbol].decimals;
+            if (preview.target === 'SL' || preview.target === 'TP') {
+              const execRef = nextLimit ?? nextEntry;
+              const proj = computeProjectedPendingSlTpPnL(
+                targetOrd.symbol,
+                targetOrd.direction,
+                targetOrd.lotSize,
+                execRef,
+                preview.price
+              );
+              showPositionFeedback(
+                'ok',
+                `Pending ${preview.target} ${formatPrice(preview.price, dec)} · ${formatSignedUSD(proj)}`
+              );
+            } else {
+              showPositionFeedback(
+                'ok',
+                `Pending ${preview.target} ${formatPrice(preview.price, dec)}`
+              );
+            }
+          }
+        }
+        selectedPendingOrderIdRef.current = null;
+        if (!freeCrosshairRef.current) {
+          crosshairRef.current.visible = false;
+        }
+        requestRedraw(true, true);
+        syncCanvasCursor();
+        return;
+      }
+
       if (mode.kind === 'positionEntryPress') {
         if (mode.wasAlreadySelected) {
           selectedPositionIdRef.current = null;
@@ -2886,6 +3307,7 @@ export const ChartCanvas = React.memo(
             );
           }
         }
+        selectedPositionIdRef.current = null;
         if (!freeCrosshairRef.current) {
           crosshairRef.current.visible = false;
         }
@@ -3070,20 +3492,21 @@ export const ChartCanvas = React.memo(
         {positionFeedback && (
           <div
             data-testid="chart-position-feedback"
-            className={`pointer-events-none absolute bottom-10 left-2.5 z-20 rounded-md px-2.5 py-1 font-mono-num text-[11px] font-bold shadow-lg ${
+            className={`animate-lv-panel-in pointer-events-none absolute bottom-10 left-2.5 z-20 rounded-md px-2.5 py-1 font-mono-num text-[11px] font-bold shadow-lg ${
               positionFeedback.kind === 'err'
                 ? 'bg-[#E54855] text-white'
-                : 'bg-[#111218]/95 border border-[#D4AF37]/60 text-white'
+                : 'bg-[#111218]/96 border border-[#D4AF37]/60 text-white'
             }`}
           >
             {positionFeedback.text}
           </div>
         )}
 
-        {/* Convenient On-Chart Zoom & Reset Controls */}
+        {/* Compact On-Chart Zoom & Reset Controls */}
         <div
-          className="absolute bottom-9 z-20 flex items-center gap-1 rounded-md border border-[#141311]/25 dark:border-[#FFFFFF]/25 bg-[#FFFFFF]/94 dark:bg-[#0E0E11]/94 p-1 shadow-lg"
-          style={{ right: `${PRICE_AXIS_WIDTH + 10}px` }}
+          data-testid="chart-zoom-controls"
+          className="absolute bottom-8 z-20 flex items-center gap-0.5 rounded border border-[#141311]/25 dark:border-[#FFFFFF]/25 bg-[#FFFFFF]/95 dark:bg-[#0E0E11]/95 p-0.5 shadow-md"
+          style={{ right: `${PRICE_AXIS_WIDTH + 8}px` }}
         >
           <button
             type="button"
@@ -3102,9 +3525,9 @@ export const ChartCanvas = React.memo(
             aria-label="Zoom Out"
             title="ZOOM OUT"
             data-testid="zoom-out-btn"
-            className="flex h-7 w-7 items-center justify-center rounded text-[#141311] dark:text-[#FFFFFF] hover:bg-[#141311]/10 dark:hover:bg-[#FFFFFF]/15 cursor-pointer"
+            className="flex h-5.5 w-5.5 items-center justify-center rounded text-[#141311] dark:text-[#FFFFFF] hover:bg-[#141311]/10 dark:hover:bg-[#FFFFFF]/15 active:scale-90 transition-transform duration-100 cursor-pointer"
           >
-            <Minus className="w-3.5 h-3.5" />
+            <Minus className="w-3 h-3" />
           </button>
           <button
             type="button"
@@ -3122,9 +3545,9 @@ export const ChartCanvas = React.memo(
             aria-label="Zoom In"
             title="ZOOM IN"
             data-testid="zoom-in-btn"
-            className="flex h-7 w-7 items-center justify-center rounded text-[#141311] dark:text-[#FFFFFF] hover:bg-[#141311]/10 dark:hover:bg-[#FFFFFF]/15 cursor-pointer"
+            className="flex h-5.5 w-5.5 items-center justify-center rounded text-[#141311] dark:text-[#FFFFFF] hover:bg-[#141311]/10 dark:hover:bg-[#FFFFFF]/15 active:scale-90 transition-transform duration-100 cursor-pointer"
           >
-            <Plus className="w-3.5 h-3.5" />
+            <Plus className="w-3 h-3" />
           </button>
           <button
             type="button"
@@ -3143,22 +3566,22 @@ export const ChartCanvas = React.memo(
             aria-label="Reset Chart View"
             title="RESET SCALE"
             data-testid="reset-scale-btn"
-            className="flex h-7 w-7 items-center justify-center rounded text-[#141311] dark:text-[#FFFFFF] hover:bg-[#141311]/10 dark:hover:bg-[#FFFFFF]/15 cursor-pointer"
+            className="flex h-5.5 w-5.5 items-center justify-center rounded text-[#141311] dark:text-[#FFFFFF] hover:bg-[#141311]/10 dark:hover:bg-[#FFFFFF]/15 active:scale-90 transition-transform duration-100 cursor-pointer"
           >
-            <RotateCcw className="w-3.5 h-3.5" />
+            <RotateCcw className="w-3 h-3" />
           </button>
         </div>
 
         {/* Full Screen Top-Right Controls: Download + Exit (×) */}
         {isFullScreen && (
-          <div className="fixed top-3 right-3 z-40 flex items-center gap-1.5">
+          <div className="animate-lv-panel-in fixed top-3 right-3 z-40 flex items-center gap-1.5">
             <button
               type="button"
               onClick={onDownloadImage}
               aria-label="Download Chart Image"
               title="DOWNLOAD CHART IMAGE"
               data-testid="download-image-btn"
-              className="flex h-8 w-8 items-center justify-center rounded-md border border-[#141311]/35 dark:border-[#FFFFFF]/45 bg-[#FFFFFF]/90 dark:bg-[#0D0D10]/90 text-[#141311] dark:text-[#FFFFFF] shadow-xl backdrop-blur-sm hover:bg-[#141311] hover:text-[#FFFFFF] dark:hover:bg-[#FFFFFF] dark:hover:text-[#080808] transition-colors cursor-pointer"
+              className="flex h-8 w-8 items-center justify-center rounded-md border border-[#141311]/35 dark:border-[#FFFFFF]/45 bg-[#FFFFFF]/95 dark:bg-[#0D0D10]/95 text-[#141311] dark:text-[#FFFFFF] shadow-xl hover:bg-[#141311] hover:text-[#FFFFFF] dark:hover:bg-[#FFFFFF] dark:hover:text-[#080808] active:scale-95 transition-all cursor-pointer"
             >
               <Download className="w-4 h-4" />
             </button>
@@ -3168,7 +3591,7 @@ export const ChartCanvas = React.memo(
               aria-label="Exit Full Screen"
               title="EXIT FULL SCREEN"
               data-testid="exit-fullscreen-btn"
-              className="flex h-8 w-8 items-center justify-center rounded-md border border-[#141311]/35 dark:border-[#FFFFFF]/45 bg-[#FFFFFF]/90 dark:bg-[#0D0D10]/90 text-[#141311] dark:text-[#FFFFFF] shadow-xl backdrop-blur-sm hover:bg-[#141311] hover:text-[#FFFFFF] dark:hover:bg-[#FFFFFF] dark:hover:text-[#080808] transition-colors cursor-pointer"
+              className="flex h-8 w-8 items-center justify-center rounded-md border border-[#141311]/35 dark:border-[#FFFFFF]/45 bg-[#FFFFFF]/95 dark:bg-[#0D0D10]/95 text-[#141311] dark:text-[#FFFFFF] shadow-xl hover:bg-[#141311] hover:text-[#FFFFFF] dark:hover:bg-[#FFFFFF] dark:hover:text-[#080808] active:scale-95 transition-all cursor-pointer"
             >
               <X className="w-4 h-4" />
             </button>
@@ -3177,7 +3600,7 @@ export const ChartCanvas = React.memo(
 
         {/* Loading Overlay */}
         {isLoading && visCandles.length === 0 && (
-          <div className="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center bg-[#FAF8F3]/75 dark:bg-[#080808]/75 backdrop-blur-[1px]">
+          <div className="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center bg-[#FAF8F3]/85 dark:bg-[#080808]/85">
             <div className="h-8 w-8 rounded-full border-2 border-[#141311]/25 dark:border-[#FFFFFF]/25 border-t-[#141311] dark:border-t-[#FFFFFF] animate-spin" />
             <p className="mt-3 text-xs font-bold tracking-[0.18em] text-[#141311] dark:text-[#FFFFFF]">
               LOADING {market} MARKET DATA

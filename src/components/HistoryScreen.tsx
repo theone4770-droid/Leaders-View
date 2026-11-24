@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowLeft,
   ArrowUpDown,
@@ -25,6 +25,7 @@ import {
   triggerJpgDownloads,
 } from '../modules/historyExport';
 import { formatPrice, MARKETS } from '../modules/timeframeManager';
+import { useAnimatedPresence } from '../hooks/useAnimatedPresence';
 
 interface HistoryScreenProps {
   open: boolean;
@@ -77,7 +78,8 @@ const CALENDAR_PRESETS: Array<{ id: CalendarPreset; label: string }> = [
   { id: 'CUSTOM', label: 'Custom Period' },
 ];
 
-export const HistoryScreen: React.FC<HistoryScreenProps> = ({ open, account, onClose }) => {
+export const HistoryScreen: React.FC<HistoryScreenProps> = React.memo(({ open, account, onClose }) => {
+  const { shouldRender, isClosing } = useAnimatedPresence(open, 165);
   const [sortOption, setSortOption] = useState<HistorySortOption>('NEWEST');
 
   const todayStr = getLocalTodayString();
@@ -97,17 +99,28 @@ export const HistoryScreen: React.FC<HistoryScreenProps> = ({ open, account, onC
   const [lastExportPages, setLastExportPages] = useState<GeneratedHistoryJpgPage[] | null>(null);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!shouldRender) {
+      setIsSortOpen(false);
+      setIsCalendarOpen(false);
+      setExportNotice(null);
+    }
+  }, [shouldRender]);
+
+  const sortAnim = useAnimatedPresence(isSortOpen, 145);
+  const calendarAnim = useAnimatedPresence(isCalendarOpen, 155);
+
   const dateRange = useMemo(
-    () => resolveCalendarRange(calendarFilter),
-    [calendarFilter]
+    () => (shouldRender ? resolveCalendarRange(calendarFilter) : { startMs: 0, endMs: 0, label: 'Today' }),
+    [shouldRender, calendarFilter]
   );
 
   const filteredPositions = useMemo(
-    () => filterAndSortPositions(account.positionHistory, 'ALL', dateRange, sortOption),
-    [account.positionHistory, dateRange, sortOption]
+    () => (shouldRender ? filterAndSortPositions(account.positionHistory, 'ALL', dateRange, sortOption) : []),
+    [shouldRender, account.positionHistory, dateRange, sortOption]
   );
 
-  if (!open) return null;
+  if (!shouldRender) return null;
 
   const positionTotalProfit = filteredPositions.reduce((s, p) => s + p.profitLoss, 0);
 
@@ -174,17 +187,28 @@ export const HistoryScreen: React.FC<HistoryScreenProps> = ({ open, account, onC
       role="dialog"
       aria-label="History Screen"
       data-testid="history-screen"
-      className="fixed inset-0 z-40 flex flex-col bg-[#050507] text-white"
+      className={`${
+        isClosing ? 'animate-lv-screen-out pointer-events-none' : 'animate-lv-screen-in'
+      } fixed inset-0 z-40 flex flex-col bg-[#050507] text-white`}
     >
+      {/* Click-outside backdrop for Sort Popover (sits below header z-50 so toolbar icons toggle/switch cleanly) */}
+      {sortAnim.shouldRender && (
+        <div
+          className={`fixed inset-0 z-40 ${sortAnim.isClosing ? 'pointer-events-none' : ''}`}
+          onClick={() => setIsSortOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
       {/* Top MetaTrader History Toolbar (White Icons, Zero Chart Displayed) */}
-      <header className="relative flex h-13 shrink-0 items-center justify-between border-b border-neutral-800 bg-[#0B0B0F] px-2 sm:px-4">
+      <header className="relative z-50 flex h-13 shrink-0 items-center justify-between border-b border-neutral-800 bg-[#0B0B0F] px-2 sm:px-4">
         <div className="flex items-center gap-1.5 min-w-0">
           <button
             type="button"
             onClick={onClose}
             aria-label="Back to Chart"
             data-testid="history-back-btn"
-            className="flex h-10 w-10 items-center justify-center rounded-md text-white hover:bg-white/10 cursor-pointer shrink-0"
+            className="flex h-10 w-10 items-center justify-center rounded-md text-white hover:bg-white/10 active:scale-95 transition-transform cursor-pointer shrink-0"
           >
             <ArrowLeft className="w-5 h-5" />
           </button>
@@ -245,10 +269,12 @@ export const HistoryScreen: React.FC<HistoryScreenProps> = ({ open, account, onC
         </div>
 
         {/* Sort Popover */}
-        {isSortOpen && (
+        {sortAnim.shouldRender && (
           <div
             data-testid="history-sort-menu"
-            className="absolute right-2 top-13 z-50 w-52 rounded-xl border border-neutral-700 bg-[#101015] p-1.5 shadow-2xl"
+            className={`${
+              sortAnim.isClosing ? 'animate-lv-panel-out pointer-events-none' : 'animate-lv-panel-in'
+            } absolute right-2 top-13 z-50 w-52 rounded-xl border border-neutral-700 bg-[#101015] p-1.5 shadow-2xl`}
           >
             {SORT_LABELS.map((opt) => (
               <button
@@ -363,7 +389,7 @@ export const HistoryScreen: React.FC<HistoryScreenProps> = ({ open, account, onC
                         <span className="text-sm font-bold text-white">{p.symbol}</span>
                         <span
                           className={`text-xs font-bold ${
-                            p.direction === 'BUY' ? 'text-[#38BDF8]' : 'text-[#F43F5E]'
+                            p.direction === 'BUY' ? 'text-[#22C55E]' : 'text-[#F43F5E]'
                           }`}
                         >
                           {p.direction.toLowerCase()} {p.lotSize.toFixed(2)}
@@ -395,11 +421,20 @@ export const HistoryScreen: React.FC<HistoryScreenProps> = ({ open, account, onC
       </div>
 
       {/* Calendar Filter Modal */}
-      {isCalendarOpen && (
-        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/75 p-3 sm:items-center">
+      {calendarAnim.shouldRender && (
+        <div
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setIsCalendarOpen(false);
+          }}
+          className={`${
+            calendarAnim.isClosing ? 'animate-lv-fade-out pointer-events-none' : 'animate-lv-fade-in'
+          } fixed inset-0 z-50 flex items-end justify-center bg-black/75 p-3 sm:items-center`}
+        >
           <div
             data-testid="history-calendar-modal"
-            className="w-full max-w-md rounded-2xl border border-neutral-700 bg-[#0E0E12] p-4 shadow-2xl"
+            className={`${
+              calendarAnim.isClosing ? 'animate-lv-modal-out' : 'animate-lv-modal-in'
+            } w-full max-w-md rounded-2xl border border-neutral-700 bg-[#0E0E12] p-4 shadow-2xl`}
           >
             <div className="flex items-center justify-between border-b border-neutral-800 pb-3">
               <span className="text-sm font-bold text-[#D4AF37]">Calendar Period</span>
@@ -407,7 +442,7 @@ export const HistoryScreen: React.FC<HistoryScreenProps> = ({ open, account, onC
                 type="button"
                 onClick={() => setIsCalendarOpen(false)}
                 aria-label="Close calendar"
-                className="flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10 cursor-pointer"
+                className="flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10 active:scale-95 transition-transform cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -467,7 +502,7 @@ export const HistoryScreen: React.FC<HistoryScreenProps> = ({ open, account, onC
                     type="button"
                     onClick={() => setIsCalendarOpen(false)}
                     data-testid="calendar-custom-cancel"
-                    className="h-10 flex-1 rounded-lg border border-neutral-700 bg-[#141419] text-xs font-bold text-white cursor-pointer"
+                    className="h-10 flex-1 rounded-lg border border-neutral-700 bg-[#141419] text-xs font-bold text-white active:scale-95 transition-transform cursor-pointer"
                   >
                     Cancel
                   </button>
@@ -475,7 +510,7 @@ export const HistoryScreen: React.FC<HistoryScreenProps> = ({ open, account, onC
                     type="button"
                     onClick={handleApplyCustomDates}
                     data-testid="calendar-custom-apply"
-                    className="h-10 flex-1 rounded-lg bg-[#D4AF37] text-xs font-bold text-black hover:bg-[#E5C158] cursor-pointer"
+                    className="h-10 flex-1 rounded-lg bg-[#D4AF37] text-xs font-bold text-black hover:bg-[#E5C158] active:scale-95 transition-transform cursor-pointer"
                   >
                     Apply
                   </button>
@@ -487,4 +522,6 @@ export const HistoryScreen: React.FC<HistoryScreenProps> = ({ open, account, onC
       )}
     </div>
   );
-};
+});
+
+HistoryScreen.displayName = 'HistoryScreen';

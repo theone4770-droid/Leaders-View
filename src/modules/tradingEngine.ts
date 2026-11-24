@@ -1,5 +1,6 @@
 import { MarketSymbol } from '../types/chart';
 import {
+  BulkCloseFilter,
   CalendarFilterState,
   ClosedPositionRecord,
   DealHistoryRecord,
@@ -9,16 +10,190 @@ import {
   OpenPosition,
   OrderHistoryRecord,
   PendingOrder,
+  PendingOrderDraft,
   PendingOrderType,
   TradeDirection,
   TradingAccountState,
 } from '../types/trading';
 import {
   computeClosedPnL,
+  computeUnrealizedPnL,
   INSTRUMENT_SPREAD_CONFIG,
   roundToInstrument,
   roundUSD,
 } from './spreadEngine';
+
+export const DEMO_ACCOUNT_LEVERAGE = 100;
+
+export function computeRequiredMarginUSD(
+  symbol: MarketSymbol,
+  lotSize: number,
+  price: number
+): number {
+  if (!Number.isFinite(lotSize) || lotSize <= 0 || !Number.isFinite(price) || price <= 0) {
+    return 0;
+  }
+  const cfg = INSTRUMENT_SPREAD_CONFIG[symbol];
+  return roundUSD((lotSize * cfg.contractSize * price) / DEMO_ACCOUNT_LEVERAGE);
+}
+
+export interface AccountMarginStats {
+  balanceUSD: number;
+  floatingPnlUSD: number;
+  equityUSD: number;
+  usedMarginUSD: number;
+  freeMarginUSD: number;
+  marginLevelPct: number;
+}
+
+export function computeAccountMarginStats(
+  state: Pick<TradingAccountState, 'balanceUSD' | 'openPositions'>,
+  quotes: Partial<Record<MarketSymbol, MarketBidAskQuote | null>>
+): AccountMarginStats {
+  let floatingPnlUSD = 0;
+  let usedMarginUSD = 0;
+  for (const pos of state.openPositions) {
+    const q = quotes[pos.symbol] ?? null;
+    if (q) {
+      floatingPnlUSD += computeUnrealizedPnL(pos, q).pnl;
+    }
+    usedMarginUSD += computeRequiredMarginUSD(pos.symbol, pos.lotSize, pos.entryPrice);
+  }
+  const equityUSD = roundUSD(state.balanceUSD + floatingPnlUSD);
+  const freeMarginUSD = roundUSD(equityUSD - usedMarginUSD);
+  const marginLevelPct = usedMarginUSD > 0 ? (equityUSD / usedMarginUSD) * 100 : Infinity;
+  return {
+    balanceUSD: roundUSD(state.balanceUSD),
+    floatingPnlUSD: roundUSD(floatingPnlUSD),
+    equityUSD,
+    usedMarginUSD: roundUSD(usedMarginUSD),
+    freeMarginUSD,
+    marginLevelPct,
+  };
+}
+
+export function computeAvailableTradeBalanceUSD(
+  state: Pick<TradingAccountState, 'balanceUSD' | 'openPositions'>,
+  quotes: Partial<Record<MarketSymbol, MarketBidAskQuote | null>>
+): number {
+  return computeAccountMarginStats(state, quotes).freeMarginUSD;
+}
+
+export function computeMaxAffordableLot(
+  symbol: MarketSymbol,
+  availableBalanceUSD: number,
+  price: number
+): number {
+  if (!Number.isFinite(availableBalanceUSD) || availableBalanceUSD <= 0 || !Number.isFinite(price) || price <= 0) {
+    return 0;
+  }
+  const cfg = INSTRUMENT_SPREAD_CONFIG[symbol];
+  const marginPerOneLot = (cfg.contractSize * price) / DEMO_ACCOUNT_LEVERAGE;
+  if (marginPerOneLot <= 0) return 0;
+  const rawMax = Math.floor((availableBalanceUSD / marginPerOneLot) * 100) / 100;
+  return Math.max(0, Math.min(1000, rawMax));
+}
+
+export interface PoorAccountBalanceStatus {
+  isPoor: boolean;
+  reason: 'DEPLETED' | 'INSUFFICIENT_MIN_LOT' | null;
+  minLotRequiredUSD: number;
+  maxLot: number;
+  equityUSD: number;
+  freeMarginUSD: number;
+}
+
+export function evaluatePoorAccountBalance(
+  state: Pick<TradingAccountState, 'balanceUSD' | 'openPositions' | 'stopOutTriggered'>,
+  symbol: MarketSymbol,
+  quotes: Partial<Record<MarketSymbol, MarketBidAskQuote | null>>
+): PoorAccountBalanceStatus {
+  const stats = computeAccountMarginStats(state, quotes);
+  const activeQuote = quotes[symbol] ?? null;
+  const refPrice = activeQuote?.ask ?? 0;
+  const minLotRequiredUSD = refPrice > 0 ? computeRequiredMarginUSD(symbol, 0.01, refPrice) : 0;
+  const maxLot = refPrice > 0 ? computeMaxAffordableLot(symbol, stats.freeMarginUSD, refPrice) : 0;
+
+  if (state.balanceUSD <= 0 || stats.equityUSD <= 0) {
+    return {
+      isPoor: true,
+      reason: 'DEPLETED',
+      minLotRequiredUSD,
+      maxLot: 0,
+      equityUSD: stats.equityUSD,
+      freeMarginUSD: stats.freeMarginUSD,
+    };
+  }
+
+  if (state.openPositions.length === 0 && activeQuote && maxLot < 0.01) {
+    return {
+      isPoor: true,
+      reason: 'INSUFFICIENT_MIN_LOT',
+      minLotRequiredUSD,
+      maxLot,
+      equityUSD: stats.equityUSD,
+      freeMarginUSD: stats.freeMarginUSD,
+    };
+  }
+
+  return {
+    isPoor: false,
+    reason: null,
+    minLotRequiredUSD,
+    maxLot,
+    equityUSD: stats.equityUSD,
+    freeMarginUSD: stats.freeMarginUSD,
+  };
+}
+
+export function buildDefaultPendingOrderDraft(
+  symbol: MarketSymbol,
+  orderType: PendingOrderType,
+  lotSize: number,
+  quote: MarketBidAskQuote
+): PendingOrderDraft {
+  const cfg = INSTRUMENT_SPREAD_CONFIG[symbol];
+  const stepDist =
+    symbol === 'XAUUSD'
+      ? Math.max(2.5, quote.spread * 8)
+      : Math.max(120, quote.spread * 6);
+  let entryPrice = quote.ask;
+  let limitPrice: number | null = null;
+
+  switch (orderType) {
+    case 'BUY_LIMIT':
+      entryPrice = roundToInstrument(Math.max(cfg.pointStep, quote.ask - stepDist), cfg.decimals);
+      break;
+    case 'SELL_LIMIT':
+      entryPrice = roundToInstrument(quote.bid + stepDist, cfg.decimals);
+      break;
+    case 'BUY_STOP':
+      entryPrice = roundToInstrument(quote.ask + stepDist, cfg.decimals);
+      break;
+    case 'SELL_STOP':
+      entryPrice = roundToInstrument(Math.max(cfg.pointStep, quote.bid - stepDist), cfg.decimals);
+      break;
+    case 'BUY_STOP_LIMIT':
+      entryPrice = roundToInstrument(quote.ask + stepDist * 1.15, cfg.decimals);
+      limitPrice = roundToInstrument(Math.max(cfg.pointStep, entryPrice - stepDist * 0.45), cfg.decimals);
+      break;
+    case 'SELL_STOP_LIMIT':
+      entryPrice = roundToInstrument(Math.max(cfg.pointStep, quote.bid - stepDist * 1.15), cfg.decimals);
+      limitPrice = roundToInstrument(entryPrice + stepDist * 0.45, cfg.decimals);
+      break;
+  }
+
+  return {
+    symbol,
+    orderType,
+    lotSize,
+    entryPrice,
+    limitPrice,
+    sl: null,
+    tp: null,
+    expiresAt: null,
+  };
+}
 
 let idSeq = 0;
 function makeId(prefix: string): string {
@@ -104,6 +279,7 @@ export function executeMarketOrder(
     sl: number | null;
     tp: number | null;
     quote: MarketBidAskQuote;
+    quotes?: Partial<Record<MarketSymbol, MarketBidAskQuote | null>>;
     nowMs?: number;
   }
 ): { ok: boolean; nextState: TradingAccountState; position?: OpenPosition; error?: string } {
@@ -128,6 +304,25 @@ export function executeMarketOrder(
   const slTpCheck = validateSlTp(params.direction, execPrice, cleanSl, cleanTp);
   if (!slTpCheck.valid) {
     return { ok: false, nextState: state, error: slTpCheck.error };
+  }
+
+  const effectiveQuotes: Partial<Record<MarketSymbol, MarketBidAskQuote | null>> = {
+    ...(params.quotes ?? {}),
+    [params.symbol]: params.quote,
+  };
+  const availableUSD = computeAvailableTradeBalanceUSD(state, effectiveQuotes);
+  const requiredMarginUSD = computeRequiredMarginUSD(params.symbol, lotCheck.normalized, execPrice);
+  if (state.balanceUSD <= 0 || availableUSD < requiredMarginUSD) {
+    const maxLot = computeMaxAffordableLot(params.symbol, availableUSD, execPrice);
+    const poorHint =
+      state.balanceUSD <= 0 || (state.openPositions.length === 0 && maxLot < 0.01)
+        ? 'POOR ACCOUNT BALANCE LEVEL SET BALANCE TO CONTINUE.'
+        : `Insufficient margin ($${Math.max(0, availableUSD).toFixed(2)} avail, needs $${requiredMarginUSD.toFixed(2)}${maxLot >= 0.01 ? ` · Max ${maxLot.toFixed(2)} lot` : ''}).`;
+    return {
+      ok: false,
+      nextState: state,
+      error: poorHint,
+    };
   }
 
   const orderId = makeId('ord');
@@ -193,7 +388,7 @@ export function closeOpenPosition(
   params: {
     positionId: string;
     quote: MarketBidAskQuote;
-    reason?: 'MANUAL' | 'SL' | 'TP';
+    reason?: 'MANUAL' | 'SL' | 'TP' | 'STOP_OUT';
     overrideExitPrice?: number;
     nowMs?: number;
   }
@@ -213,7 +408,10 @@ export function closeOpenPosition(
         : params.quote.ask;
   const exitPrice = roundToInstrument(rawExit, cfg.decimals);
   const pnl = computeClosedPnL(pos.symbol, pos.direction, pos.lotSize, pos.entryPrice, exitPrice);
-  const nextBalance = roundUSD(state.balanceUSD + pnl);
+  const rawNextBalance = roundUSD(state.balanceUSD + pnl);
+  // Zero-balance protection when Stop-Out closes an exhausted account
+  const nextBalance =
+    params.reason === 'STOP_OUT' ? Math.max(0, rawNextBalance) : rawNextBalance;
 
   const closeOrderId = makeId('ord');
   const closeDealId = makeId('deal');
@@ -286,6 +484,79 @@ export function closeOpenPosition(
       dealHistory: [closeDealRec, ...state.dealHistory],
       ledger: [ledgerEntry, ...state.ledger],
     },
+  };
+}
+
+export function closeMultiplePositions(
+  state: TradingAccountState,
+  params: {
+    filter: BulkCloseFilter;
+    quotes: Partial<Record<MarketSymbol, MarketBidAskQuote | null>>;
+    nowMs?: number;
+  }
+): {
+  ok: boolean;
+  nextState: TradingAccountState;
+  closedCount: number;
+  totalPnl: number;
+  error?: string;
+} {
+  if (state.openPositions.length === 0) {
+    return {
+      ok: false,
+      nextState: state,
+      closedCount: 0,
+      totalPnl: 0,
+      error: 'No open positions to close.',
+    };
+  }
+
+  const now = params.nowMs ?? Date.now();
+  let curState = state;
+  let closedCount = 0;
+  let totalPnl = 0;
+
+  for (const pos of state.openPositions) {
+    const quote = params.quotes[pos.symbol];
+    if (!quote) continue;
+    const { pnl } = computeUnrealizedPnL(pos, quote);
+    if (params.filter === 'PROFITABLE' && pnl <= 0) continue;
+    if (params.filter === 'LOSING' && pnl >= 0) continue;
+
+    const res = closeOpenPosition(curState, {
+      positionId: pos.id,
+      quote,
+      reason: 'MANUAL',
+      nowMs: now,
+    });
+    if (res.ok && res.closed) {
+      curState = res.nextState;
+      closedCount += 1;
+      totalPnl = roundUSD(totalPnl + res.closed.profitLoss);
+    }
+  }
+
+  if (closedCount === 0) {
+    const label =
+      params.filter === 'PROFITABLE'
+        ? 'profitable'
+        : params.filter === 'LOSING'
+          ? 'losing'
+          : 'matching';
+    return {
+      ok: false,
+      nextState: state,
+      closedCount: 0,
+      totalPnl: 0,
+      error: `No ${label} open positions found.`,
+    };
+  }
+
+  return {
+    ok: true,
+    nextState: curState,
+    closedCount,
+    totalPnl,
   };
 }
 
@@ -407,6 +678,7 @@ export function createPendingOrder(
     tp: number | null;
     expiresAt: number | null;
     quote: MarketBidAskQuote;
+    quotes?: Partial<Record<MarketSymbol, MarketBidAskQuote | null>>;
     nowMs?: number;
   }
 ): { ok: boolean; nextState: TradingAccountState; order?: PendingOrder; error?: string } {
@@ -441,6 +713,26 @@ export function createPendingOrder(
   });
   if (!priceCheck.valid) {
     return { ok: false, nextState: state, error: priceCheck.error };
+  }
+
+  const refExecPrice = isStopLimit && limitPrice !== null ? limitPrice : entryPrice;
+  const effectiveQuotes: Partial<Record<MarketSymbol, MarketBidAskQuote | null>> = {
+    ...(params.quotes ?? {}),
+    [params.symbol]: params.quote,
+  };
+  const availableUSD = computeAvailableTradeBalanceUSD(state, effectiveQuotes);
+  const requiredMarginUSD = computeRequiredMarginUSD(params.symbol, lotCheck.normalized, refExecPrice);
+  if (state.balanceUSD <= 0 || availableUSD < requiredMarginUSD) {
+    const maxLot = computeMaxAffordableLot(params.symbol, availableUSD, refExecPrice);
+    const poorHint =
+      state.balanceUSD <= 0 || (state.openPositions.length === 0 && maxLot < 0.01)
+        ? 'POOR ACCOUNT BALANCE LEVEL SET BALANCE TO CONTINUE.'
+        : `Insufficient margin ($${Math.max(0, availableUSD).toFixed(2)} avail, needs $${requiredMarginUSD.toFixed(2)}${maxLot >= 0.01 ? ` · Max ${maxLot.toFixed(2)} lot` : ''}).`;
+    return {
+      ok: false,
+      nextState: state,
+      error: poorHint,
+    };
   }
 
   const direction = getDirectionForPendingType(params.orderType);
@@ -616,12 +908,19 @@ export function depositOrResetDemoBalance(
     ...state,
     balanceUSD: nextBalance,
     initialBalanceUSD: mode === 'RESET' ? cleanAmount : state.initialBalanceUSD,
+    stopOutTriggered: false,
     ledger: [entry, ...state.ledger],
   };
 }
 
 export interface TradingTickTriggerEvent {
-  kind: 'PENDING_FILLED' | 'PENDING_EXPIRED' | 'POSITION_SL' | 'POSITION_TP';
+  kind:
+    | 'PENDING_FILLED'
+    | 'PENDING_EXPIRED'
+    | 'PENDING_REJECTED'
+    | 'POSITION_SL'
+    | 'POSITION_TP'
+    | 'ACCOUNT_STOP_OUT';
   symbol: MarketSymbol;
   message: string;
 }
@@ -719,42 +1018,63 @@ export function evaluateMarketTickForTrading(
       }
 
       if (shouldFill) {
+        const availableUSD = computeAvailableTradeBalanceUSD(
+          {
+            balanceUSD: curState.balanceUSD,
+            openPositions: [...filledPositions, ...curState.openPositions],
+          },
+          quotes
+        );
+        const requiredMarginUSD = computeRequiredMarginUSD(order.symbol, order.lotSize, execPrice);
         changed = true;
-        const posId = makeId('pos');
-        const dealId = makeId('deal');
-        filledPositions.push({
-          id: posId,
-          symbol: order.symbol,
-          direction: order.direction,
-          lotSize: order.lotSize,
-          entryPrice: execPrice,
-          sl: order.sl,
-          tp: order.tp,
-          openedAt: nowMs,
-          sourceOrderId: order.id,
-        });
-        newDeals.push({
-          id: dealId,
-          orderId: order.id,
-          positionId: posId,
-          symbol: order.symbol,
-          direction: order.direction,
-          dealType: 'IN',
-          lotSize: order.lotSize,
-          executedPrice: execPrice,
-          executedAt: nowMs,
-          profitLoss: null,
-        });
-        historyPatchMap.set(order.id, {
-          status: 'Filled',
-          executedPrice: execPrice,
-          updatedAt: nowMs,
-        });
-        events.push({
-          kind: 'PENDING_FILLED',
-          symbol: order.symbol,
-          message: `${order.symbol} ${formatOrderTypeLabel(order.orderType)} ${order.lotSize.toFixed(2)} filled @ ${execPrice.toFixed(cfg.decimals)}`,
-        });
+        if (curState.balanceUSD <= 0 || availableUSD < requiredMarginUSD) {
+          historyPatchMap.set(order.id, {
+            status: 'Rejected',
+            updatedAt: nowMs,
+            note: `Insufficient balance ($${Math.max(0, availableUSD).toFixed(2)} avail, needs $${requiredMarginUSD.toFixed(2)})`,
+          });
+          events.push({
+            kind: 'PENDING_REJECTED',
+            symbol: order.symbol,
+            message: `${order.symbol} ${formatOrderTypeLabel(order.orderType)} rejected (insufficient balance)`,
+          });
+        } else {
+          const posId = makeId('pos');
+          const dealId = makeId('deal');
+          filledPositions.push({
+            id: posId,
+            symbol: order.symbol,
+            direction: order.direction,
+            lotSize: order.lotSize,
+            entryPrice: execPrice,
+            sl: order.sl,
+            tp: order.tp,
+            openedAt: nowMs,
+            sourceOrderId: order.id,
+          });
+          newDeals.push({
+            id: dealId,
+            orderId: order.id,
+            positionId: posId,
+            symbol: order.symbol,
+            direction: order.direction,
+            dealType: 'IN',
+            lotSize: order.lotSize,
+            executedPrice: execPrice,
+            executedAt: nowMs,
+            profitLoss: null,
+          });
+          historyPatchMap.set(order.id, {
+            status: 'Filled',
+            executedPrice: execPrice,
+            updatedAt: nowMs,
+          });
+          events.push({
+            kind: 'PENDING_FILLED',
+            symbol: order.symbol,
+            message: `${order.symbol} ${formatOrderTypeLabel(order.orderType)} ${order.lotSize.toFixed(2)} filled @ ${execPrice.toFixed(cfg.decimals)}`,
+          });
+        }
       } else {
         remainingPending.push(updatedOrder);
       }
@@ -820,6 +1140,54 @@ export function evaluateMarketTickForTrading(
           });
         }
       }
+    }
+  }
+
+  // 3. Evaluate Account Stop-Out (auto-close open trades when balance/equity is exhausted)
+  if (curState.openPositions.length > 0) {
+    let stopOutEmitted = false;
+    let stats = computeAccountMarginStats(curState, quotes);
+
+    while (
+      curState.openPositions.length > 0 &&
+      (stats.equityUSD <= 0 ||
+        (curState.balanceUSD <= 0 && stats.usedMarginUSD > 0 && stats.equityUSD < stats.usedMarginUSD * 0.2))
+    ) {
+      const candidates = curState.openPositions
+        .map((pos) => {
+          const q = quotes[pos.symbol];
+          return q ? { pos, quote: q, pnl: computeUnrealizedPnL(pos, q).pnl } : null;
+        })
+        .filter((item): item is { pos: OpenPosition; quote: MarketBidAskQuote; pnl: number } => item !== null)
+        .sort((a, b) => a.pnl - b.pnl);
+
+      if (candidates.length === 0) break;
+
+      const worst = candidates[0];
+      const exitPrice = worst.pos.direction === 'BUY' ? worst.quote.bid : worst.quote.ask;
+      const res = closeOpenPosition(curState, {
+        positionId: worst.pos.id,
+        quote: worst.quote,
+        reason: 'STOP_OUT',
+        overrideExitPrice: exitPrice,
+        nowMs,
+      });
+      if (!res.ok) break;
+
+      curState = {
+        ...res.nextState,
+        stopOutTriggered: true,
+      };
+      changed = true;
+      if (!stopOutEmitted) {
+        stopOutEmitted = true;
+        events.push({
+          kind: 'ACCOUNT_STOP_OUT',
+          symbol: worst.pos.symbol,
+          message: 'POOR ACCOUNT BALANCE LEVEL SET BALANCE TO CONTINUE',
+        });
+      }
+      stats = computeAccountMarginStats(curState, quotes);
     }
   }
 

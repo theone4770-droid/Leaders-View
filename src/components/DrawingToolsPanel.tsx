@@ -10,6 +10,7 @@ import {
   VISUAL_STICKERS,
 } from '../modules/drawingCatalogue';
 import { ToolIcon } from './ToolIcon';
+import { useAnimatedPresence } from '../hooks/useAnimatedPresence';
 
 interface DrawingToolsPanelProps {
   open: boolean;
@@ -34,6 +35,7 @@ export const DrawingToolsPanel: React.FC<DrawingToolsPanelProps> = React.memo(({
   onToggleShowFavoritesOnChart,
   onClose,
 }) => {
+  const { shouldRender, isClosing } = useAnimatedPresence(open, 155);
   const [search, setSearch] = useState('');
   const [activeCategory, setActiveCategory] = useState<DrawingCategoryId>('FAVORITES');
   const [visualSubPicker, setVisualSubPicker] = useState<'EMOJIS' | 'STICKERS' | 'ICONS' | null>(
@@ -43,6 +45,7 @@ export const DrawingToolsPanel: React.FC<DrawingToolsPanelProps> = React.memo(({
   const favoriteSet = useMemo(() => new Set(favoriteIds), [favoriteIds]);
 
   const filteredTools = useMemo<DrawingToolDefinition[]>(() => {
+    if (!shouldRender) return [];
     const q = search.trim().toLowerCase();
     if (q) {
       return DRAWING_TOOLS.filter(
@@ -56,9 +59,9 @@ export const DrawingToolsPanel: React.FC<DrawingToolsPanelProps> = React.memo(({
       return favoriteIds.map((id) => TOOL_BY_ID[id]).filter(Boolean);
     }
     return DRAWING_TOOLS.filter((t) => t.category === activeCategory);
-  }, [search, activeCategory, favoriteIds]);
+  }, [shouldRender, search, activeCategory, favoriteIds]);
 
-  if (!open) return null;
+  if (!shouldRender) return null;
 
   const handleToolClick = (tool: DrawingToolDefinition) => {
     if (tool.isVisualPicker) {
@@ -81,11 +84,15 @@ export const DrawingToolsPanel: React.FC<DrawingToolsPanelProps> = React.memo(({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center sm:items-end sm:justify-start bg-black/65 p-2 pb-14 sm:pl-4"
+      className={`${
+        isClosing ? 'animate-lv-fade-out pointer-events-none' : 'animate-lv-fade-in'
+      } fixed inset-0 z-50 flex items-center justify-center sm:items-end sm:justify-start bg-black/65 p-2 pb-14 sm:pl-4`}
       onClick={onClose}
     >
       <div
-        className="w-full max-w-2xl h-[calc(100dvh-64px)] sm:h-[min(560px,calc(100dvh-72px))] flex flex-col rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#0F0F12] shadow-2xl overflow-hidden"
+        className={`${
+          isClosing ? 'animate-lv-modal-out' : 'animate-lv-modal-in'
+        } w-full max-w-2xl h-[calc(100dvh-64px)] sm:h-[min(560px,calc(100dvh-72px))] flex flex-col rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#0F0F12] shadow-2xl overflow-hidden`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Panel Header + Search */}

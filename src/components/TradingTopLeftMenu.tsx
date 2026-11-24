@@ -38,7 +38,7 @@ export const TradingTopLeftMenu: React.FC<TradingTopLeftMenuProps> = React.memo(
     };
 
     const btnClass = (target: Exclude<TradingScreen, 'NONE'>) =>
-      `relative flex h-10 w-10 items-center justify-center rounded-md transition-colors cursor-pointer text-white hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] ${
+      `relative flex h-10 w-10 items-center justify-center rounded-md transition-all duration-150 active:scale-90 cursor-pointer text-white hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] ${
         activeScreen === target ? 'bg-white/15 ring-1 ring-[#D4AF37]' : ''
       }`;
 
@@ -46,7 +46,7 @@ export const TradingTopLeftMenu: React.FC<TradingTopLeftMenuProps> = React.memo(
       <nav
         aria-label="Trading Top-Left Menu"
         data-testid="trading-top-left-menu"
-        className="absolute top-2.5 left-2.5 z-30 flex items-center gap-0.5 rounded-lg border border-white/25 bg-[#0C0C0F]/85 p-0.5 shadow-xl backdrop-blur-md"
+        className="absolute top-2.5 left-2.5 z-30 flex items-center gap-0.5 rounded-lg border border-white/25 bg-[#0C0C0F]/95 p-0.5 shadow-xl"
       >
         {/* 1. Trade Icon: Two vertical up/down arrows with dollar symbol */}
         <button

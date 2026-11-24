@@ -7,6 +7,7 @@ import {
   saveFavoritesBarOrientation,
 } from '../modules/drawingStorage';
 import { ToolIcon } from './ToolIcon';
+import { useAnimatedPresence } from '../hooks/useAnimatedPresence';
 
 interface FloatingFavoritesBarProps {
   visible: boolean;
@@ -28,6 +29,10 @@ export const FloatingFavoritesBar: React.FC<FloatingFavoritesBarProps> = React.m
     onHide,
     onPositionChange,
   }) => {
+    const { shouldRender, isClosing } = useAnimatedPresence(
+      visible && favoriteIds.length > 0,
+      145
+    );
     const barRef = useRef<HTMLDivElement | null>(null);
     const [pos, setPos] = useState<{ x: number; y: number } | null>(initialPosition);
     const [orientation, setOrientation] = useState<FavoritesBarOrientation>(() =>
@@ -61,9 +66,17 @@ export const FloatingFavoritesBar: React.FC<FloatingFavoritesBarProps> = React.m
     });
 
     useEffect(() => {
+      const applyDragDelta = (nextPos: { x: number; y: number }) => {
+        const el = barRef.current;
+        if (!el) return;
+        const d = draggingRef.current;
+        el.style.transform = `translate3d(${nextPos.x - d.origX}px, ${nextPos.y - d.origY}px, 0)`;
+      };
+
       const applyDomPos = (nextPos: { x: number; y: number }) => {
         const el = barRef.current;
         if (!el) return;
+        el.style.transform = '';
         el.style.right = 'auto';
         el.style.left = `${nextPos.x}px`;
         el.style.top = `${nextPos.y}px`;
@@ -85,7 +98,7 @@ export const FloatingFavoritesBar: React.FC<FloatingFavoritesBarProps> = React.m
           d.rafId = requestAnimationFrame(() => {
             d.rafId = null;
             if (d.pendingPos) {
-              applyDomPos(d.pendingPos);
+              applyDragDelta(d.pendingPos);
               d.pendingPos = null;
             }
           });
@@ -101,10 +114,11 @@ export const FloatingFavoritesBar: React.FC<FloatingFavoritesBarProps> = React.m
           d.rafId = null;
         }
         if (d.pendingPos) {
-          applyDomPos(d.pendingPos);
+          posRef.current = d.pendingPos;
           d.pendingPos = null;
         }
         if (posRef.current) {
+          applyDomPos(posRef.current);
           setPos(posRef.current);
           onPositionChangeRef.current(posRef.current);
         }
@@ -159,7 +173,7 @@ export const FloatingFavoritesBar: React.FC<FloatingFavoritesBarProps> = React.m
       }
     }, [visible, orientation, favoriteIds.length]);
 
-    if (!visible || favoriteIds.length === 0) return null;
+    if (!shouldRender || favoriteIds.length === 0) return null;
 
     const startDrag = (e: React.PointerEvent) => {
       e.preventDefault();
@@ -198,7 +212,9 @@ export const FloatingFavoritesBar: React.FC<FloatingFavoritesBarProps> = React.m
         aria-label="Favorite Drawing Tools"
         data-testid="floating-favorites-bar"
         data-orientation={orientation}
-        className={`lv-gpu-layer fixed z-30 flex items-center gap-0.5 rounded-lg border border-[#FFFFFF]/40 bg-[#0A0A0C]/96 p-1 shadow-[0_10px_28px_rgba(0,0,0,0.55)] no-scrollbar select-none ${
+        className={`lv-gpu-layer ${
+          isClosing ? 'animate-lv-panel-out pointer-events-none' : 'animate-lv-panel-in'
+        } fixed z-30 flex items-center gap-0.5 rounded-lg border border-[#FFFFFF]/40 bg-[#0A0A0C]/96 p-1 shadow-[0_10px_28px_rgba(0,0,0,0.55)] no-scrollbar select-none ${
           isLandscape
             ? 'flex-row max-w-[calc(100vw-24px)] overflow-x-auto'
             : 'flex-col max-h-[calc(100dvh-76px)] overflow-y-auto'

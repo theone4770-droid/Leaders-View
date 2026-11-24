@@ -2,6 +2,7 @@ import React from 'react';
 import { Check, X } from 'lucide-react';
 import { ConnectionStatus, MarketSymbol, TickerData } from '../types/chart';
 import { formatPrice, MARKETS } from '../modules/timeframeManager';
+import { useAnimatedPresence } from '../hooks/useAnimatedPresence';
 
 interface MarketSelectorModalProps {
   open: boolean;
@@ -22,15 +23,21 @@ export const MarketSelectorModal: React.FC<MarketSelectorModalProps> = React.mem
   onSelect,
   onClose,
 }) => {
-  if (!open) return null;
+  const { shouldRender, isClosing } = useAnimatedPresence(open, 155);
+
+  if (!shouldRender) return null;
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-end justify-center sm:justify-start bg-black/60 p-3 pb-14 sm:pl-4"
+      className={`${
+        isClosing ? 'animate-lv-fade-out pointer-events-none' : 'animate-lv-fade-in'
+      } fixed inset-0 z-50 flex items-end justify-center sm:justify-start bg-black/60 p-3 pb-14 sm:pl-4`}
       onClick={onClose}
     >
       <div
-        className="w-full max-w-md max-h-[calc(100dvh-68px)] overflow-y-auto rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#101012] shadow-2xl"
+        className={`${
+          isClosing ? 'animate-lv-modal-out' : 'animate-lv-modal-in'
+        } w-full max-w-md max-h-[calc(100dvh-68px)] overflow-y-auto rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#101012] shadow-2xl`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-[#141311]/15 dark:border-[#FFFFFF]/15">

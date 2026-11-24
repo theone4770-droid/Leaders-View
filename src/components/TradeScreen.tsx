@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlarmClock,
   ArrowLeft,
@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { MarketSymbol } from '../types/chart';
 import {
+  BulkCloseFilter,
   MarketBidAskQuote,
   OpenPosition,
   TradeDirection,
@@ -21,8 +22,17 @@ import {
   computeUnrealizedPnL,
   formatSpreadPoints,
   INSTRUMENT_SPREAD_CONFIG,
+  roundUSD,
 } from '../modules/spreadEngine';
+import {
+  computeAvailableTradeBalanceUSD,
+  computeMaxAffordableLot,
+  computeRequiredMarginUSD,
+  DEMO_ACCOUNT_LEVERAGE,
+  evaluatePoorAccountBalance,
+} from '../modules/tradingEngine';
 import { formatPrice, MARKETS } from '../modules/timeframeManager';
+import { useAnimatedPresence } from '../hooks/useAnimatedPresence';
 
 interface TradeScreenProps {
   open: boolean;
@@ -38,6 +48,11 @@ interface TradeScreenProps {
     tp: number | null;
   }) => { ok: boolean; error?: string };
   onClosePosition: (positionId: string) => { ok: boolean; error?: string };
+  onCloseBulkPositions: (filter: BulkCloseFilter) => {
+    ok: boolean;
+    closedCount?: number;
+    error?: string;
+  };
   onModifyPositionSlTp: (params: {
     positionId: string;
     sl: number | null;
@@ -46,6 +61,7 @@ interface TradeScreenProps {
   onSetBalance: (amount: number) => void;
   onSwitchScreen: (screen: TradingScreen) => void;
   onClose: () => void;
+  openSetBalanceNonce?: number;
 }
 
 function formatUSD(value: number, signed = false): string {
@@ -66,7 +82,7 @@ function parseOptionalPrice(raw: string): { valid: boolean; value: number | null
   return { valid: true, value: n };
 }
 
-export const TradeScreen: React.FC<TradeScreenProps> = ({
+export const TradeScreen: React.FC<TradeScreenProps> = React.memo(({
   open,
   account,
   selectedMarket,
@@ -74,11 +90,15 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
   onToggleActiveBuySell,
   onExecuteOrder,
   onClosePosition,
+  onCloseBulkPositions,
   onModifyPositionSlTp,
   onSetBalance,
   onSwitchScreen,
   onClose,
+  openSetBalanceNonce = 0,
 }) => {
+  const { shouldRender, isClosing } = useAnimatedPresence(open, 165);
+
   const [lotInput, setLotInput] = useState('0.10');
   const [slInput, setSlInput] = useState('');
   const [tpInput, setTpInput] = useState('');
@@ -97,6 +117,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
   const [modifyPosId, setModifyPosId] = useState<string | null>(null);
   const [modifySlInput, setModifySlInput] = useState('');
   const [modifyTpInput, setModifyTpInput] = useState('');
+  const [modifyFeedback, setModifyFeedback] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
 
   const activeQuote = quotes[selectedMarket] ?? null;
   const cfg = INSTRUMENT_SPREAD_CONFIG[selectedMarket];
@@ -105,12 +126,87 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
     setFeedback(null);
   }, [selectedMarket, open]);
 
+  useEffect(() => {
+    if (!shouldRender) {
+      setIsEditingBalance(false);
+      setExpandedPosId(null);
+      setModifyPosId(null);
+      setModifyFeedback(null);
+    }
+  }, [shouldRender]);
+
+  useEffect(() => {
+    if (open && openSetBalanceNonce > 0) {
+      setIsEditingBalance(true);
+      setBalanceInput(account.balanceUSD > 0 ? String(account.balanceUSD) : '');
+    }
+  }, [open, openSetBalanceNonce]);
+
   const modifyTargetPosition = useMemo(
     () => account.openPositions.find((p) => p.id === modifyPosId) ?? null,
     [account.openPositions, modifyPosId]
   );
 
-  if (!open) return null;
+  const lastModifyPosRef = useRef<OpenPosition | null>(modifyTargetPosition);
+  if (modifyTargetPosition) {
+    lastModifyPosRef.current = modifyTargetPosition;
+  }
+  const modifyModalAnim = useAnimatedPresence(Boolean(modifyPosId && modifyTargetPosition), 155);
+  const activeModifyPosition = modifyTargetPosition ?? lastModifyPosRef.current;
+
+  const liveSummary = useMemo(() => {
+    if (!shouldRender) {
+      return { totalProfit: 0, totalLoss: 0, netPnL: 0 };
+    }
+    let totalProfit = 0;
+    let totalLoss = 0;
+    let netPnL = 0;
+    for (const pos of account.openPositions) {
+      const { pnl } = computeUnrealizedPnL(pos, quotes[pos.symbol] ?? null);
+      if (pnl > 0) totalProfit += pnl;
+      else if (pnl < 0) totalLoss += pnl;
+      netPnL += pnl;
+    }
+    return {
+      totalProfit: roundUSD(totalProfit),
+      totalLoss: roundUSD(totalLoss),
+      netPnL: roundUSD(netPnL),
+    };
+  }, [shouldRender, account.openPositions, quotes]);
+
+  const availableTradeBalance = useMemo(
+    () => (shouldRender ? computeAvailableTradeBalanceUSD(account, quotes) : 0),
+    [shouldRender, account, quotes]
+  );
+
+  const maxAffordableLot = useMemo(() => {
+    if (!shouldRender || !activeQuote) return 0;
+    return computeMaxAffordableLot(selectedMarket, availableTradeBalance, activeQuote.ask);
+  }, [shouldRender, selectedMarket, availableTradeBalance, activeQuote]);
+
+  const poorStatus = useMemo(
+    () =>
+      shouldRender
+        ? evaluatePoorAccountBalance(account, selectedMarket, quotes)
+        : {
+            isPoor: false,
+            reason: null,
+            minLotRequiredUSD: 0,
+            maxLot: 0,
+            equityUSD: account.balanceUSD,
+            freeMarginUSD: account.balanceUSD,
+          },
+    [shouldRender, account, selectedMarket, quotes]
+  );
+
+  const estimatedMarginUSD = useMemo(() => {
+    if (!shouldRender || !activeQuote) return 0;
+    const lot = Number(lotInput);
+    if (!Number.isFinite(lot) || lot <= 0) return 0;
+    return computeRequiredMarginUSD(selectedMarket, lot, activeQuote.ask);
+  }, [shouldRender, activeQuote, lotInput, selectedMarket]);
+
+  if (!shouldRender) return null;
 
   const openQuickPanel = (pos: OpenPosition) => {
     const decimals = MARKETS[pos.symbol].decimals;
@@ -131,13 +227,17 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
     setModifyPosId(pos.id);
     setModifySlInput(pos.sl !== null ? pos.sl.toFixed(decimals) : '');
     setModifyTpInput(pos.tp !== null ? pos.tp.toFixed(decimals) : '');
-    setFeedback(null);
+    setModifyFeedback(null);
   };
 
   const adjustLot = (delta: number) => {
     const cur = Number(lotInput);
     const base = Number.isFinite(cur) && cur > 0 ? cur : 0.01;
-    const next = Math.min(1000, Math.max(0.01, Math.round((base + delta) * 100) / 100));
+    let candidate = Math.round((base + delta) * 100) / 100;
+    if (delta > 0 && maxAffordableLot >= 0.01) {
+      candidate = Math.min(maxAffordableLot, candidate);
+    }
+    const next = Math.min(1000, Math.max(0.01, candidate));
     setLotInput(next.toFixed(2));
   };
 
@@ -209,10 +309,11 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
 
   const handleSaveModifyModal = () => {
     if (!modifyTargetPosition) return;
+    setModifyFeedback(null);
     const slParsed = parseOptionalPrice(modifySlInput);
     const tpParsed = parseOptionalPrice(modifyTpInput);
     if (!slParsed.valid || !tpParsed.valid) {
-      setFeedback({ kind: 'error', text: 'Enter valid numeric SL / TP prices or leave blank.' });
+      setModifyFeedback({ kind: 'error', text: 'Enter valid numeric SL / TP prices or leave blank.' });
       return;
     }
     const res = onModifyPositionSlTp({
@@ -221,11 +322,40 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
       tp: tpParsed.value,
     });
     if (!res.ok) {
-      setFeedback({ kind: 'error', text: res.error || 'Unable to modify position.' });
+      setModifyFeedback({ kind: 'error', text: res.error || 'Unable to modify position.' });
       return;
     }
     setModifyPosId(null);
+    setModifyFeedback(null);
     setFeedback({ kind: 'ok', text: `${modifyTargetPosition.symbol} position modified.` });
+  };
+
+  const handleCloseSinglePosition = (pos: OpenPosition) => {
+    setFeedback(null);
+    const res = onClosePosition(pos.id);
+    if (!res.ok) {
+      setFeedback({ kind: 'error', text: res.error || 'Unable to close position.' });
+      return;
+    }
+    setExpandedPosId((cur) => (cur === pos.id ? null : cur));
+    setFeedback({
+      kind: 'ok',
+      text: `Closed ${pos.symbol} ${pos.direction} ${pos.lotSize.toFixed(2)} lot.`,
+    });
+  };
+
+  const handleBulkClose = (filter: BulkCloseFilter) => {
+    setFeedback(null);
+    const res = onCloseBulkPositions(filter);
+    if (!res.ok) {
+      setFeedback({ kind: 'error', text: res.error || 'No matching positions to close.' });
+      return;
+    }
+    setExpandedPosId(null);
+    setFeedback({
+      kind: 'ok',
+      text: `Closed ${res.closedCount ?? 0} position${res.closedCount === 1 ? '' : 's'}.`,
+    });
   };
 
   return (
@@ -233,7 +363,9 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
       role="dialog"
       aria-label="Trade Screen"
       data-testid="trade-screen"
-      className="fixed inset-0 z-40 flex flex-col bg-[#050507] text-white"
+      className={`${
+        isClosing ? 'animate-lv-screen-out pointer-events-none' : 'animate-lv-screen-in'
+      } fixed inset-0 z-40 flex flex-col bg-[#050507] text-white`}
     >
       {/* Top MetaTrader-style Header */}
       <header className="flex h-13 shrink-0 items-center justify-between border-b border-neutral-800 bg-[#0B0B0F] px-3">
@@ -243,7 +375,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
             onClick={onClose}
             aria-label="Back to Chart"
             data-testid="trade-back-btn"
-            className="flex h-10 w-10 items-center justify-center rounded-md text-white hover:bg-white/10 cursor-pointer"
+            className="flex h-10 w-10 items-center justify-center rounded-md text-white hover:bg-white/10 active:scale-95 transition-transform cursor-pointer"
           >
             <ArrowLeft className="w-5 h-5" />
           </button>
@@ -259,7 +391,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
             onClick={() => onSwitchScreen('PENDING')}
             aria-label="Open Pending Orders"
             title="Pending Orders"
-            className="flex h-10 w-10 items-center justify-center rounded-md text-white hover:bg-white/10 cursor-pointer"
+            className="flex h-10 w-10 items-center justify-center rounded-md text-white hover:bg-white/10 active:scale-95 transition-transform cursor-pointer"
           >
             <AlarmClock className="w-[19px] h-[19px]" />
           </button>
@@ -268,15 +400,36 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
             onClick={() => onSwitchScreen('HISTORY')}
             aria-label="Open History"
             title="History"
-            className="flex h-10 w-10 items-center justify-center rounded-md text-white hover:bg-white/10 cursor-pointer"
+            className="flex h-10 w-10 items-center justify-center rounded-md text-white hover:bg-white/10 active:scale-95 transition-transform cursor-pointer"
           >
             <History className="w-[19px] h-[19px]" />
           </button>
         </div>
       </header>
 
+      {poorStatus.isPoor && (
+        <div
+          data-testid="trade-poor-balance-banner"
+          className="animate-lv-panel-in flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-[#E54855]/75 bg-[#2A0B10] px-3 py-2 text-xs shadow-lg"
+        >
+          <span className="font-bold tracking-wide text-[#FCA5A5]">
+            POOR ACCOUNT BALANCE LEVEL SET BALANCE TO CONTINUE
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              setIsEditingBalance(true);
+              setBalanceInput('');
+            }}
+            className="rounded-md bg-[#D4AF37] px-2.5 py-1 text-[11px] font-bold text-black hover:bg-[#E5C158] active:scale-95 transition-transform cursor-pointer"
+          >
+            Set Balance
+          </button>
+        </div>
+      )}
+
       {/* Scrollable Body */}
-      <div className="flex-1 overflow-y-auto px-3 py-3 sm:px-5">
+      <div className="lv-scroll-smooth flex-1 overflow-y-auto px-3 py-3 sm:px-5">
         <div className="mx-auto flex w-full max-w-4xl flex-col gap-3">
           {/* Top Account Balance Row — USD ONLY + Unlimited Set Balance + Active BUY/SELL */}
           <section className="rounded-xl border border-neutral-800 bg-[#0D0D11] p-3.5">
@@ -308,9 +461,14 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                 </div>
               </div>
 
-              {/* Active BUY/SELL Master Switch */}
+              {/* Animated Active BUY/SELL Master Switch */}
               <div className="flex flex-col items-end gap-1 shrink-0">
-                <span className="text-[11px] font-semibold tracking-wide text-neutral-300">
+                <span className="flex items-center gap-1.5 text-[11px] font-semibold tracking-wide text-neutral-300">
+                  <span
+                    className={`h-2 w-2 rounded-full transition-colors duration-200 ${
+                      account.activeBuySell ? 'bg-[#19B87D] shadow-[0_0_8px_#19B87D]' : 'bg-neutral-600'
+                    }`}
+                  />
                   Active BUY/SELL
                 </span>
                 <button
@@ -319,20 +477,26 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                   aria-checked={account.activeBuySell}
                   data-testid="active-buysell-toggle"
                   onClick={() => onToggleActiveBuySell(!account.activeBuySell)}
-                  className={`flex h-9 min-w-[82px] items-center justify-between rounded-full border px-1.5 transition-colors cursor-pointer ${
+                  className={`relative flex h-9 w-[86px] items-center rounded-full border transition-colors duration-200 active:scale-95 cursor-pointer ${
                     account.activeBuySell
                       ? 'border-[#19B87D] bg-[#19B87D]/20 text-[#19B87D]'
                       : 'border-neutral-700 bg-neutral-900 text-neutral-400'
                   }`}
                 >
-                  <span className="px-1.5 text-[11px] font-bold">
-                    {account.activeBuySell ? 'ON' : 'OFF'}
-                  </span>
                   <span
-                    className={`h-6 w-6 rounded-full transition-transform ${
-                      account.activeBuySell ? 'bg-[#19B87D]' : 'bg-neutral-600'
+                    className={`absolute top-1 left-1 h-6.5 w-6.5 rounded-full shadow-md transition-transform duration-200 ease-out will-change-transform ${
+                      account.activeBuySell
+                        ? 'translate-x-[50px] bg-[#19B87D]'
+                        : 'translate-x-0 bg-neutral-500'
                     }`}
                   />
+                  <span
+                    className={`w-full px-2.5 text-[11px] font-bold transition-all duration-200 ${
+                      account.activeBuySell ? 'text-left' : 'text-right'
+                    }`}
+                  >
+                    {account.activeBuySell ? 'ON' : 'OFF'}
+                  </span>
                 </button>
               </div>
             </div>
@@ -342,7 +506,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
               <form
                 onSubmit={handleApplyBalance}
                 data-testid="set-balance-form"
-                className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-[#D4AF37]/40 bg-[#08080B] p-2.5"
+                className="animate-lv-panel-in mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-[#D4AF37]/40 bg-[#08080B] p-2.5"
               >
                 <input
                   type="number"
@@ -376,7 +540,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
             {!account.activeBuySell ? (
               <div
                 data-testid="trading-controls-disabled-banner"
-                className="mt-3 rounded-lg border border-neutral-800 bg-[#08080A] px-3 py-4 text-center"
+                className="animate-lv-panel-in mt-3 rounded-lg border border-neutral-800 bg-[#08080A] px-3 py-4 text-center"
               >
                 <div className="text-xs font-semibold text-neutral-300">
                   Trading controls are turned OFF
@@ -386,7 +550,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                 </div>
               </div>
             ) : (
-              <div className="mt-3 flex flex-col gap-3" data-testid="trading-controls-panel">
+              <div className="animate-lv-panel-in mt-3 flex flex-col gap-3" data-testid="trading-controls-panel">
                 {/* Active Chart Symbol Bid / Ask / Spread Info (no duplicate symbol picker) */}
                 <div className="rounded-lg border border-neutral-800 bg-[#08080B] px-3 py-2">
                   <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] font-semibold tracking-wider text-neutral-400">
@@ -409,7 +573,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                       </span>
                     </div>
                     <div>
-                      <span className="mr-1 text-[10px] text-[#38BDF8]">BUY/ASK</span>
+                      <span className="mr-1 text-[10px] text-[#22C55E]">BUY/ASK</span>
                       <span data-testid="trade-ask-price" className="text-base font-bold text-white">
                         {activeQuote ? formatPrice(activeQuote.ask, cfg.decimals) : '—'}
                       </span>
@@ -420,12 +584,27 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                 {/* Lot Size Input (0.01 to 1000 precise manual input) + SL & TP */}
                 <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                   <div>
-                    <label
-                      htmlFor="trade-lot-input"
-                      className="mb-1 block text-[11px] font-semibold uppercase tracking-wider text-neutral-400"
-                    >
-                      Lot Size (0.01 – 1000)
-                    </label>
+                    <div className="mb-1 flex items-center justify-between gap-1">
+                      <label
+                        htmlFor="trade-lot-input"
+                        className="block text-[11px] font-semibold uppercase tracking-wider text-neutral-400"
+                      >
+                        Lot (0.01 – 1000)
+                      </label>
+                      <button
+                        type="button"
+                        disabled={maxAffordableLot < 0.01}
+                        onClick={() => {
+                          if (maxAffordableLot >= 0.01) {
+                            setLotInput(maxAffordableLot.toFixed(2));
+                          }
+                        }}
+                        data-testid="trade-max-lot-btn"
+                        className="font-mono-num text-[10px] font-semibold text-[#D4AF37] hover:underline disabled:text-neutral-500 disabled:no-underline cursor-pointer"
+                      >
+                        Max {maxAffordableLot.toFixed(2)} (1:{DEMO_ACCOUNT_LEVERAGE})
+                      </button>
+                    </div>
                     <div className="flex h-11 items-center rounded-lg border border-neutral-700 bg-[#121216]">
                       <button
                         type="button"
@@ -456,6 +635,17 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                         <Plus className="w-3.5 h-3.5" />
                       </button>
                     </div>
+                    {activeQuote && (
+                      <div
+                        className={`mt-1 font-mono-num text-[10px] ${
+                          estimatedMarginUSD > availableTradeBalance || poorStatus.isPoor
+                            ? 'text-[#F87171]'
+                            : 'text-neutral-400'
+                        }`}
+                      >
+                        Req: {formatUSD(estimatedMarginUSD)} · Avail: {formatUSD(Math.max(0, availableTradeBalance))}
+                      </div>
+                    )}
                   </div>
 
                   <div>
@@ -533,7 +723,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                     disabled={!activeQuote}
                     onClick={() => handleOrder('BUY')}
                     data-testid="trade-buy-btn"
-                    className="flex h-12 flex-col items-center justify-center rounded-lg bg-[#0284C7] px-3 text-white shadow hover:bg-[#0369A1] disabled:opacity-45 cursor-pointer"
+                    className="flex h-12 flex-col items-center justify-center rounded-lg bg-[#16A34A] px-3 text-white shadow hover:bg-[#15803D] disabled:opacity-45 cursor-pointer"
                   >
                     <span className="text-[11px] font-bold tracking-wider">BUY BY MARKET</span>
                     <span className="font-mono-num text-sm font-bold">
@@ -560,7 +750,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
 
           {/* Open Positions Section */}
           <section className="rounded-xl border border-neutral-800 bg-[#0D0D11]">
-            <div className="flex items-center justify-between border-b border-neutral-800 px-3.5 py-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-neutral-800 px-3.5 py-2.5">
               <h2 className="text-xs font-bold uppercase tracking-wider text-[#D4AF37]">
                 Open Positions ({account.openPositions.length})
               </h2>
@@ -568,6 +758,78 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                 Tap position or price to manage
               </span>
             </div>
+
+            {/* Total Live Profit & Total Live Loss Summary Box inside Open Positions */}
+            <div
+              data-testid="live-pnl-summary-box"
+              className="mx-3.5 mt-3 grid grid-cols-3 gap-2 rounded-lg border border-neutral-800 bg-[#08080B] p-2.5"
+            >
+              <div>
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-neutral-400">
+                  Total Live Profit
+                </div>
+                <div
+                  data-testid="total-live-profit-val"
+                  className="mt-0.5 font-mono-num text-sm font-bold text-[#19B87D]"
+                >
+                  {formatUSD(liveSummary.totalProfit, true)}
+                </div>
+              </div>
+              <div>
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-neutral-400">
+                  Total Live Loss
+                </div>
+                <div
+                  data-testid="total-live-loss-val"
+                  className="mt-0.5 font-mono-num text-sm font-bold text-[#E54855]"
+                >
+                  {formatUSD(liveSummary.totalLoss, false)}
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-neutral-400">
+                  Net Live P/L
+                </div>
+                <div
+                  data-testid="total-live-net-val"
+                  className={`mt-0.5 font-mono-num text-sm font-bold ${
+                    liveSummary.netPnL >= 0 ? 'text-[#19B87D]' : 'text-[#E54855]'
+                  }`}
+                >
+                  {formatUSD(liveSummary.netPnL, true)}
+                </div>
+              </div>
+            </div>
+
+            {/* Bulk Close Actions: Close All / Close Profitable / Close Losing */}
+            {account.openPositions.length > 0 && (
+              <div className="mx-3.5 mt-2.5 grid grid-cols-3 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => handleBulkClose('ALL')}
+                  data-testid="close-all-positions-btn"
+                  className="h-9 rounded-lg border border-neutral-700 bg-[#14141A] px-2 text-[11px] font-bold text-white hover:border-white active:scale-95 transition-transform whitespace-nowrap cursor-pointer"
+                >
+                  Close All
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleBulkClose('PROFITABLE')}
+                  data-testid="close-profitable-positions-btn"
+                  className="h-9 rounded-lg border border-[#19B87D]/45 bg-[#0B2219] px-2 text-[11px] font-bold text-[#19B87D] hover:border-[#19B87D] active:scale-95 transition-transform whitespace-nowrap cursor-pointer"
+                >
+                  Close Profitable
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleBulkClose('LOSING')}
+                  data-testid="close-losing-positions-btn"
+                  className="h-9 rounded-lg border border-[#E54855]/45 bg-[#230C10] px-2 text-[11px] font-bold text-[#F87171] hover:border-[#E54855] active:scale-95 transition-transform whitespace-nowrap cursor-pointer"
+                >
+                  Close Losing
+                </button>
+              </div>
+            )}
 
             {account.openPositions.length === 0 ? (
               <div className="px-4 py-6 text-center text-xs text-neutral-500">
@@ -602,7 +864,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                             <span className="text-sm font-bold text-white">{pos.symbol}</span>
                             <span
                               className={`text-xs font-bold ${
-                                pos.direction === 'BUY' ? 'text-[#38BDF8]' : 'text-[#F43F5E]'
+                                pos.direction === 'BUY' ? 'text-[#22C55E]' : 'text-[#F43F5E]'
                               }`}
                             >
                               {pos.direction.toLowerCase()} {pos.lotSize.toFixed(2)}
@@ -691,9 +953,9 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                           <div className="mt-2.5 flex flex-wrap items-center gap-2">
                             <button
                               type="button"
-                              onClick={() => onClosePosition(pos.id)}
+                              onClick={() => handleCloseSinglePosition(pos)}
                               data-testid={`close-pos-btn-${pos.id}`}
-                              className="h-10 flex-1 rounded-md bg-[#E54855] px-3 text-xs font-bold text-white hover:bg-[#D63946] cursor-pointer"
+                              className="h-10 flex-1 rounded-md bg-[#E54855] px-3 text-xs font-bold text-white hover:bg-[#D63946] active:scale-95 transition-transform cursor-pointer"
                             >
                               Close Position
                             </button>
@@ -725,30 +987,45 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
       </div>
 
       {/* Full Modify Position Panel (opened via Modify Arrow) */}
-      {modifyTargetPosition && (
-        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/75 p-3 sm:items-center">
+      {modifyModalAnim.shouldRender && activeModifyPosition && (
+        <div
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setModifyPosId(null);
+              setModifyFeedback(null);
+            }
+          }}
+          className={`${
+            modifyModalAnim.isClosing ? 'animate-lv-fade-out pointer-events-none' : 'animate-lv-fade-in'
+          } fixed inset-0 z-50 flex items-end justify-center bg-black/75 p-3 sm:items-center`}
+        >
           <div
             data-testid="modify-position-modal"
-            className="w-full max-w-md rounded-2xl border border-neutral-700 bg-[#0E0E12] p-4 shadow-2xl"
+            className={`${
+              modifyModalAnim.isClosing ? 'animate-lv-modal-out' : 'animate-lv-modal-in'
+            } w-full max-w-md rounded-2xl border border-neutral-700 bg-[#0E0E12] p-4 shadow-2xl`}
           >
             <div className="flex items-center justify-between border-b border-neutral-800 pb-3">
               <div>
                 <h3 className="text-sm font-bold text-[#D4AF37]">
-                  Modify Position · {modifyTargetPosition.symbol}
+                  Modify Position · {activeModifyPosition.symbol}
                 </h3>
                 <p className="mt-0.5 font-mono-num text-xs text-neutral-400">
-                  {modifyTargetPosition.direction} {modifyTargetPosition.lotSize.toFixed(2)} @{' '}
+                  {activeModifyPosition.direction} {activeModifyPosition.lotSize.toFixed(2)} @{' '}
                   {formatPrice(
-                    modifyTargetPosition.entryPrice,
-                    MARKETS[modifyTargetPosition.symbol].decimals
+                    activeModifyPosition.entryPrice,
+                    MARKETS[activeModifyPosition.symbol].decimals
                   )}
                 </p>
               </div>
               <button
                 type="button"
-                onClick={() => setModifyPosId(null)}
+                onClick={() => {
+                  setModifyPosId(null);
+                  setModifyFeedback(null);
+                }}
                 aria-label="Close modify panel"
-                className="flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10 cursor-pointer"
+                className="flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10 active:scale-95 transition-transform cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -762,7 +1039,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                 <input
                   type="number"
                   inputMode="decimal"
-                  step={INSTRUMENT_SPREAD_CONFIG[modifyTargetPosition.symbol].pointStep}
+                  step={INSTRUMENT_SPREAD_CONFIG[activeModifyPosition.symbol].pointStep}
                   placeholder="Blank to clear"
                   value={modifySlInput}
                   onChange={(e) => setModifySlInput(e.target.value)}
@@ -777,7 +1054,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                 <input
                   type="number"
                   inputMode="decimal"
-                  step={INSTRUMENT_SPREAD_CONFIG[modifyTargetPosition.symbol].pointStep}
+                  step={INSTRUMENT_SPREAD_CONFIG[activeModifyPosition.symbol].pointStep}
                   placeholder="Blank to clear"
                   value={modifyTpInput}
                   onChange={(e) => setModifyTpInput(e.target.value)}
@@ -787,23 +1064,26 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
               </div>
             </div>
 
-            {feedback && (
+            {modifyFeedback && (
               <div
                 className={`mt-3 rounded-lg border px-3 py-2 text-xs ${
-                  feedback.kind === 'error'
+                  modifyFeedback.kind === 'error'
                     ? 'border-[#E54855]/50 bg-[#E54855]/10 text-[#F87171]'
                     : 'border-[#19B87D]/50 bg-[#19B87D]/10 text-[#19B87D]'
                 }`}
               >
-                {feedback.text}
+                {modifyFeedback.text}
               </div>
             )}
 
             <div className="mt-4 flex gap-2">
               <button
                 type="button"
-                onClick={() => setModifyPosId(null)}
-                className="h-11 flex-1 rounded-lg border border-neutral-700 bg-[#141419] text-xs font-bold text-white cursor-pointer"
+                onClick={() => {
+                  setModifyPosId(null);
+                  setModifyFeedback(null);
+                }}
+                className="h-11 flex-1 rounded-lg border border-neutral-700 bg-[#141419] text-xs font-bold text-white active:scale-95 transition-transform cursor-pointer"
               >
                 Cancel
               </button>
@@ -811,7 +1091,7 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
                 type="button"
                 onClick={handleSaveModifyModal}
                 data-testid="modify-modal-save-btn"
-                className="h-11 flex-1 rounded-lg bg-[#D4AF37] text-xs font-bold text-black hover:bg-[#E5C158] cursor-pointer"
+                className="h-11 flex-1 rounded-lg bg-[#D4AF37] text-xs font-bold text-black hover:bg-[#E5C158] active:scale-95 transition-transform cursor-pointer"
               >
                 Save Changes
               </button>
@@ -821,4 +1101,6 @@ export const TradeScreen: React.FC<TradeScreenProps> = ({
       )}
     </div>
   );
-};
+});
+
+TradeScreen.displayName = 'TradeScreen';

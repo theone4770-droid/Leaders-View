@@ -105,7 +105,7 @@ export interface ClosedPositionRecord {
   openedAt: number;
   closedAt: number;
   profitLoss: number;
-  closeReason: 'MANUAL' | 'SL' | 'TP';
+  closeReason: 'MANUAL' | 'SL' | 'TP' | 'STOP_OUT';
 }
 
 export interface OrderHistoryRecord {
@@ -159,4 +159,18 @@ export interface TradingAccountState {
   orderHistory: OrderHistoryRecord[];
   dealHistory: DealHistoryRecord[];
   ledger: BalanceLedgerEntry[];
+  stopOutTriggered?: boolean;
+}
+
+export type BulkCloseFilter = 'ALL' | 'PROFITABLE' | 'LOSING';
+
+export interface PendingOrderDraft {
+  symbol: MarketSymbol;
+  orderType: PendingOrderType;
+  lotSize: number;
+  entryPrice: number;
+  limitPrice: number | null;
+  sl: number | null;
+  tp: number | null;
+  expiresAt: number | null;
 }

@@ -62,6 +62,7 @@ export function loadTradingAccountState(): TradingAccountState {
         Array.isArray(parsed.ledger) && parsed.ledger.length > 0
           ? parsed.ledger
           : fallback.ledger,
+      stopOutTriggered: parsed.stopOutTriggered === true,
     };
   } catch {
     return fallback;

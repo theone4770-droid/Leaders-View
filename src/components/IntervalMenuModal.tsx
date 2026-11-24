@@ -2,6 +2,7 @@ import React from 'react';
 import { X } from 'lucide-react';
 import { TimeframeId } from '../types/chart';
 import { INTERVAL_SECTIONS } from '../modules/timeframeManager';
+import { useAnimatedPresence } from '../hooks/useAnimatedPresence';
 
 interface IntervalMenuModalProps {
   open: boolean;
@@ -16,15 +17,21 @@ export const IntervalMenuModal: React.FC<IntervalMenuModalProps> = React.memo(({
   onSelectInterval,
   onClose,
 }) => {
-  if (!open) return null;
+  const { shouldRender, isClosing } = useAnimatedPresence(open, 155);
+
+  if (!shouldRender) return null;
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-end justify-center sm:justify-start bg-black/60 p-3 pb-14 sm:pl-24"
+      className={`${
+        isClosing ? 'animate-lv-fade-out pointer-events-none' : 'animate-lv-fade-in'
+      } fixed inset-0 z-50 flex items-end justify-center sm:justify-start bg-black/60 p-3 pb-14 sm:pl-24`}
       onClick={onClose}
     >
       <div
-        className="w-full max-w-sm max-h-[calc(100dvh-68px)] flex flex-col rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#101012] shadow-2xl overflow-hidden"
+        className={`${
+          isClosing ? 'animate-lv-modal-out' : 'animate-lv-modal-in'
+        } w-full max-w-sm max-h-[calc(100dvh-68px)] flex flex-col rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#101012] shadow-2xl overflow-hidden`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-[#141311]/15 dark:border-[#FFFFFF]/15 shrink-0">

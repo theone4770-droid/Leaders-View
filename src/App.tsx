@@ -93,21 +93,29 @@ import { TradeScreen } from './components/TradeScreen';
 import { PendingOrdersScreen } from './components/PendingOrdersScreen';
 import { HistoryScreen } from './components/HistoryScreen';
 import { OnChartQuickTrade } from './components/OnChartQuickTrade';
+import { PendingOrderTopBar } from './components/PendingOrderTopBar';
 import { usePWAInstall } from './hooks/usePWAInstall';
 import { computeBidAskQuote } from './modules/spreadEngine';
 import {
+  buildDefaultPendingOrderDraft,
   cancelPendingOrder,
+  closeMultiplePositions,
   closeOpenPosition,
+  computeAvailableTradeBalanceUSD,
+  computeMaxAffordableLot,
   createPendingOrder,
   depositOrResetDemoBalance,
   evaluateMarketTickForTrading,
+  evaluatePoorAccountBalance,
   executeMarketOrder,
   modifyOpenPositionSlTp,
   modifyPendingOrder,
 } from './modules/tradingEngine';
 import { loadTradingAccountState, saveTradingAccountState } from './modules/tradingStorage';
 import {
+  BulkCloseFilter,
   MarketBidAskQuote,
+  PendingOrderDraft,
   PendingOrderType,
   TradeDirection,
   TradingAccountState,
@@ -119,6 +127,7 @@ interface TriggeredToast {
   market: MarketSymbol;
   price: number;
   note: string;
+  title?: string;
 }
 
 const EMPTY_TICKERS: Partial<Record<MarketSymbol, TickerData>> = {};
@@ -226,7 +235,9 @@ export default function App() {
 
   // MetaTrader Demo Trading State
   const [activeTradingScreen, setActiveTradingScreen] = useState<TradingScreen>('NONE');
+  const [openSetBalanceNonce, setOpenSetBalanceNonce] = useState(0);
   const [quickLotSize, setQuickLotSize] = useState<number>(0.1);
+  const [pendingOrderDraft, setPendingOrderDraft] = useState<PendingOrderDraft | null>(null);
   const [tradingAccount, setTradingAccount] = useState<TradingAccountState>(() =>
     loadTradingAccountState()
   );
@@ -258,6 +269,10 @@ export default function App() {
   const loadedKeyRef = useRef<string | null>(
     initialHydrationRef.current ? `${market}:${currentInterval}` : null
   );
+  const lastAcceptedTickTsRef = useRef<Record<MarketSymbol, number>>({
+    XAUUSD: initialTickersRef.current?.tickers?.XAUUSD?.timestamp ?? 0,
+    BTCUSD: initialTickersRef.current?.tickers?.BTCUSD?.timestamp ?? 0,
+  });
   marketRef.current = market;
   intervalRef.current = currentInterval;
   replayRef.current = replay;
@@ -274,7 +289,19 @@ export default function App() {
     setSelectedDrawingId(null);
 
     const applyLoadedCandles = (candles: Candle[], status: ConnectionStatus) => {
-      candlesRef.current = candles;
+      const syncedCandles =
+        candles.length > 0 && tickersRef.current[market]?.price
+          ? [
+              ...candles.slice(0, -1),
+              {
+                ...candles[candles.length - 1],
+                close: tickersRef.current[market]!.price,
+                high: Math.max(candles[candles.length - 1].high, tickersRef.current[market]!.price),
+                low: Math.min(candles[candles.length - 1].low, tickersRef.current[market]!.price),
+              },
+            ]
+          : candles;
+      candlesRef.current = syncedCandles;
       loadedKeyRef.current = `${market}:${currentInterval}`;
       setCandlesVersion((v) => v + 1);
       setConnectionStatus((prev) => (prev === 'LIVE' ? 'LIVE' : status));
@@ -284,7 +311,7 @@ export default function App() {
         ...prev,
         [market]: {
           ...prev[market],
-          rightOffset: Math.max(candles.length + 8, 20),
+          rightOffset: Math.max(syncedCandles.length + 8, 20),
           autoScaleY: true,
         },
       }));
@@ -483,9 +510,61 @@ export default function App() {
         setConnectionStatus((prev) => (prev === status ? prev : status));
       },
       onTickersUpdate: (incoming) => {
-        queueTickersBatch(incoming);
+        const freshIncoming: Partial<Record<MarketSymbol, TickerData>> = {};
+        for (const k of Object.keys(incoming) as MarketSymbol[]) {
+          const val = incoming[k];
+          if (!val) continue;
+          const prevTs = lastAcceptedTickTsRef.current[k] ?? 0;
+          if (val.timestamp >= prevTs) {
+            lastAcceptedTickTsRef.current[k] = val.timestamp;
+            freshIncoming[k] = val;
+          }
+        }
+        queueTickersBatch(freshIncoming);
+        // Evaluate pending orders, SL/TP & Stop-Out when batch tickers update
+        if (
+          Object.keys(freshIncoming).length > 0 &&
+          (tradingAccountRef.current.pendingOrders.length > 0 ||
+            tradingAccountRef.current.openPositions.length > 0)
+        ) {
+          const mergedQuotes: Partial<Record<MarketSymbol, MarketBidAskQuote | null>> = {
+            ...quotesRef.current,
+          };
+          let latestTs = Date.now();
+          for (const sym of Object.keys(freshIncoming) as MarketSymbol[]) {
+            const t = freshIncoming[sym];
+            if (t) {
+              mergedQuotes[sym] = computeBidAskQuote(sym, t.price, 'LIVE', t.timestamp);
+              latestTs = Math.max(latestTs, t.timestamp);
+            }
+          }
+          const { nextState, changed, events } = evaluateMarketTickForTrading(
+            tradingAccountRef.current,
+            mergedQuotes,
+            latestTs
+          );
+          if (changed) {
+            tradingAccountRef.current = nextState;
+            setTradingAccount(nextState);
+            for (const ev of events) {
+              setTriggeredToasts((prev) => [
+                {
+                  id: `trd_${latestTs}_${Math.random().toString(36).slice(2, 6)}`,
+                  market: ev.symbol,
+                  price: freshIncoming[ev.symbol]?.price ?? quotesRef.current[ev.symbol]?.bid ?? 0,
+                  note: ev.message,
+                  title:
+                    ev.kind === 'ACCOUNT_STOP_OUT'
+                      ? `STOP OUT · ${ev.symbol}`
+                      : `TRADE UPDATE · ${ev.symbol}`,
+                },
+                ...prev.slice(0, 3),
+              ]);
+            }
+          }
+        }
         const activeMarket = marketRef.current;
-        const activeTicker = incoming[activeMarket];
+        const activeTicker = freshIncoming[activeMarket];
         if (
           activeTicker &&
           replayRef.current.mode === 'OFF' &&
@@ -506,6 +585,11 @@ export default function App() {
         }
       },
       onTick: (tick) => {
+        const prevTs = lastAcceptedTickTsRef.current[tick.market] ?? 0;
+        if (tick.timestamp < prevTs) {
+          return;
+        }
+        lastAcceptedTickTsRef.current[tick.market] = tick.timestamp;
         pendingTickers[tick.market] = tick.ticker;
         if (tickerFlushTimer === null) {
           tickerFlushTimer = window.setTimeout(flushTickers, 150);
@@ -531,12 +615,16 @@ export default function App() {
           }
         }
 
-        // Evaluate demo pending orders & open position SL/TP against live/simulated Bid & Ask
+        // Evaluate demo pending orders, SL/TP & Stop-Out against combined live quotes
         const liveQuote = computeBidAskQuote(tick.market, tick.price, 'LIVE', tick.timestamp);
         if (liveQuote && (tradingAccountRef.current.pendingOrders.length > 0 || tradingAccountRef.current.openPositions.length > 0)) {
+          const combinedQuotes: Partial<Record<MarketSymbol, MarketBidAskQuote | null>> = {
+            ...quotesRef.current,
+            [tick.market]: liveQuote,
+          };
           const { nextState, changed, events } = evaluateMarketTickForTrading(
             tradingAccountRef.current,
-            { [tick.market]: liveQuote },
+            combinedQuotes,
             tick.timestamp
           );
           if (changed) {
@@ -549,6 +637,10 @@ export default function App() {
                   market: ev.symbol,
                   price: tick.price,
                   note: ev.message,
+                  title:
+                    ev.kind === 'ACCOUNT_STOP_OUT'
+                      ? `STOP OUT · ${ev.symbol}`
+                      : `TRADE UPDATE · ${ev.symbol}`,
                 },
                 ...prev.slice(0, 3),
               ]);
@@ -620,11 +712,26 @@ export default function App() {
     return () => clearInterval(timer);
   }, [replay.mode, replay.speed, replay.cutIndex]);
 
+  const hasOverlayOpenRef = useRef(false);
+  hasOverlayOpenRef.current =
+    activeTradingScreen !== 'NONE' ||
+    isMarketModalOpen ||
+    isIntervalModalOpen ||
+    isDrawingPanelOpen ||
+    isThreeDotsOpen ||
+    isIndicatorsOpen ||
+    isAlertsOpen;
+
+  const nativeFullscreenActiveRef = useRef(false);
+
   // Global keyboard shortcuts (Undo, Redo, Delete selected drawing)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT')) {
+        return;
+      }
+      if (hasOverlayOpenRef.current) {
         return;
       }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
@@ -652,21 +759,34 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [selectedDrawingId]);
 
-  // Sync browser fullscreen events cleanly
+  // Sync browser fullscreen events cleanly when native fullscreen actually engaged
   useEffect(() => {
     const onFsChange = () => {
-      if (!document.fullscreenElement && isFullScreen) {
-        // Keep app fullscreen toggle controllable even if browser exits
+      const isNativeFs = Boolean(document.fullscreenElement);
+      if (isNativeFs) {
+        nativeFullscreenActiveRef.current = true;
+      } else if (nativeFullscreenActiveRef.current) {
+        nativeFullscreenActiveRef.current = false;
+        setIsFullScreen(false);
       }
     };
     document.addEventListener('fullscreenchange', onFsChange);
     return () => document.removeEventListener('fullscreenchange', onFsChange);
-  }, [isFullScreen]);
+  }, []);
 
   // Handlers
   const handleSelectMarket = useCallback((nextMarket: MarketSymbol) => {
     setMarket(nextMarket);
+    setPendingOrderDraft(null);
     saveSelectedMarket(nextMarket);
+    const q = quotesRef.current[nextMarket];
+    if (q) {
+      const avail = computeAvailableTradeBalanceUSD(tradingAccountRef.current, quotesRef.current);
+      const maxLot = computeMaxAffordableLot(nextMarket, avail, q.ask);
+      if (maxLot >= 0.01) {
+        setQuickLotSize((cur) => (cur > maxLot ? maxLot : cur));
+      }
+    }
   }, []);
 
   const handleSelectInterval = useCallback(
@@ -757,11 +877,19 @@ export default function App() {
     setIsFullScreen((prev) => {
       const next = !prev;
       if (next) {
-        document.documentElement.requestFullscreen?.().catch(() => {
-          // App-level maximized layout still active even inside iframe
-        });
+        document.documentElement
+          .requestFullscreen?.()
+          .then(() => {
+            nativeFullscreenActiveRef.current = true;
+          })
+          .catch(() => {
+            nativeFullscreenActiveRef.current = false;
+          });
       } else if (document.fullscreenElement) {
+        nativeFullscreenActiveRef.current = false;
         document.exitFullscreen?.().catch(() => {});
+      } else {
+        nativeFullscreenActiveRef.current = false;
       }
       return next;
     });
@@ -1002,7 +1130,11 @@ export default function App() {
     }) => {
       const q = quotesRef.current[params.symbol];
       if (!q) return { ok: false, error: 'Waiting for market quote.' };
-      const res = executeMarketOrder(tradingAccountRef.current, { ...params, quote: q });
+      const res = executeMarketOrder(tradingAccountRef.current, {
+        ...params,
+        quote: q,
+        quotes: quotesRef.current,
+      });
       if (res.ok) {
         tradingAccountRef.current = res.nextState;
         setTradingAccount(res.nextState);
@@ -1023,6 +1155,18 @@ export default function App() {
       setTradingAccount(res.nextState);
     }
     return { ok: res.ok, error: res.error };
+  }, []);
+
+  const handleCloseBulkPositions = useCallback((filter: BulkCloseFilter) => {
+    const res = closeMultiplePositions(tradingAccountRef.current, {
+      filter,
+      quotes: quotesRef.current,
+    });
+    if (res.ok) {
+      tradingAccountRef.current = res.nextState;
+      setTradingAccount(res.nextState);
+    }
+    return { ok: res.ok, closedCount: res.closedCount, error: res.error };
   }, []);
 
   const handleModifyPositionSlTp = useCallback(
@@ -1052,7 +1196,11 @@ export default function App() {
     }) => {
       const q = quotesRef.current[params.symbol];
       if (!q) return { ok: false, error: 'Waiting for market quote.' };
-      const res = createPendingOrder(tradingAccountRef.current, { ...params, quote: q });
+      const res = createPendingOrder(tradingAccountRef.current, {
+        ...params,
+        quote: q,
+        quotes: quotesRef.current,
+      });
       if (res.ok) {
         tradingAccountRef.current = res.nextState;
         setTradingAccount(res.nextState);
@@ -1061,6 +1209,43 @@ export default function App() {
     },
     []
   );
+
+  const handleSelectPendingOrderTypeOnChart = useCallback(
+    (orderType: PendingOrderType, lotSize: number) => {
+      const curMarket = marketRef.current;
+      const q = quotesRef.current[curMarket];
+      if (!q) return;
+      const draft = buildDefaultPendingOrderDraft(curMarket, orderType, lotSize, q);
+      setQuickLotSize(lotSize);
+      setPendingOrderDraft(draft);
+      setActiveTradingScreen('NONE');
+    },
+    []
+  );
+
+  const handleExecutePendingDraft = useCallback(
+    (draft: PendingOrderDraft) => {
+      const res = handlePlacePendingOrder({
+        symbol: draft.symbol,
+        orderType: draft.orderType,
+        lotSize: draft.lotSize,
+        entryPrice: draft.entryPrice,
+        limitPrice: draft.limitPrice,
+        sl: draft.sl,
+        tp: draft.tp,
+        expiresAt: draft.expiresAt,
+      });
+      if (res.ok) {
+        setPendingOrderDraft(null);
+      }
+      return res;
+    },
+    [handlePlacePendingOrder]
+  );
+
+  const handleCancelPendingDraft = useCallback(() => {
+    setPendingOrderDraft(null);
+  }, []);
 
   const handleModifyPendingOrder = useCallback(
     (params: {
@@ -1094,13 +1279,58 @@ export default function App() {
     const next = depositOrResetDemoBalance(tradingAccountRef.current, 'RESET', amount);
     tradingAccountRef.current = next;
     setTradingAccount(next);
+    const curMarket = marketRef.current;
+    const q = quotesRef.current[curMarket];
+    if (q) {
+      const avail = computeAvailableTradeBalanceUSD(next, quotesRef.current);
+      const maxLot = computeMaxAffordableLot(curMarket, avail, q.ask);
+      if (maxLot >= 0.01) {
+        setQuickLotSize((cur) => (cur > maxLot ? maxLot : cur));
+      }
+    }
+  }, []);
+
+  const handleOpenSetBalance = useCallback(() => {
+    setOpenSetBalanceNonce((n) => n + 1);
+    setActiveTradingScreen('TRADE');
   }, []);
 
   const closeTradingScreen = useCallback(() => setActiveTradingScreen('NONE'), []);
 
+  const quickMaxLot = useMemo(() => {
+    const q = quotes[market];
+    if (!q) return 0;
+    const avail = computeAvailableTradeBalanceUSD(tradingAccount, quotes);
+    return computeMaxAffordableLot(market, avail, q.ask);
+  }, [market, quotes, tradingAccount]);
+
+  const poorBalanceStatus = useMemo(
+    () => evaluatePoorAccountBalance(tradingAccount, market, quotes),
+    [tradingAccount, market, quotes]
+  );
+
   return (
     <div className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-[#FAF8F3] dark:bg-[#080808] text-[#141311] dark:text-[#F5F5F7]">
       {showOpening && <OpeningScreen isReady={!isLoadingCandles} onComplete={handleOpeningComplete} />}
+
+      {poorBalanceStatus.isPoor && activeTradingScreen === 'NONE' && (
+        <div
+          data-testid="poor-balance-banner"
+          className="animate-lv-panel-in z-30 flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-[#E54855]/75 bg-[#2A0B10] px-3 py-1.5 text-[11px] text-[#FCA5A5]"
+        >
+          <span className="font-bold tracking-wide">
+            POOR ACCOUNT BALANCE LEVEL SET BALANCE TO CONTINUE
+          </span>
+          <button
+            type="button"
+            onClick={handleOpenSetBalance}
+            data-testid="poor-balance-set-btn"
+            className="rounded bg-[#D4AF37] px-2.5 py-0.5 text-[10px] font-bold text-black hover:bg-[#E5C158] active:scale-95 transition-transform cursor-pointer"
+          >
+            Set Balance
+          </button>
+        </div>
+      )}
 
       {/* MAIN CHART VIEWPORT (Chart-First, Bottom Navigation Bar) */}
       <main className="relative flex-1 min-h-0 w-full overflow-hidden">
@@ -1143,12 +1373,25 @@ export default function App() {
           quote={quotes[market] ?? null}
           openPositions={tradingAccount.openPositions}
           pendingOrders={tradingAccount.pendingOrders}
+          pendingOrderDraft={replay.mode === 'OFF' ? pendingOrderDraft : null}
+          onUpdatePendingOrderDraft={setPendingOrderDraft}
           onModifyPositionSlTp={handleModifyPositionSlTp}
+          onModifyPendingOrder={handleModifyPendingOrder}
           hasQuickTradeBar={
             tradingAccount.activeBuySell &&
             activeTradingScreen === 'NONE' &&
             replay.mode === 'OFF'
           }
+        />
+
+        {/* Top Modify & Execute Bar when placing a Pending Order directly on Chart */}
+        <PendingOrderTopBar
+          draft={replay.mode === 'OFF' && activeTradingScreen === 'NONE' ? pendingOrderDraft : null}
+          quote={quotes[market] ?? null}
+          hasQuickTradeBar={tradingAccount.activeBuySell}
+          onUpdateDraft={setPendingOrderDraft}
+          onExecute={handleExecutePendingDraft}
+          onCancel={handleCancelPendingDraft}
         />
 
         {/* On-Chart MT5 One-Click SELL / Lot +/- / BUY Panel (when Active BUY/SELL is ON) */}
@@ -1161,6 +1404,8 @@ export default function App() {
           market={market}
           quote={quotes[market] ?? null}
           lotSize={quickLotSize}
+          maxAffordableLot={quickMaxLot}
+          isPoorBalance={poorBalanceStatus.isPoor}
           onChangeLotSize={setQuickLotSize}
           onExecuteQuickOrder={handleExecuteMarketOrder}
         />
@@ -1291,10 +1536,12 @@ export default function App() {
         onToggleActiveBuySell={handleToggleActiveBuySell}
         onExecuteOrder={handleExecuteMarketOrder}
         onClosePosition={handleClosePosition}
+        onCloseBulkPositions={handleCloseBulkPositions}
         onModifyPositionSlTp={handleModifyPositionSlTp}
         onSetBalance={handleSetBalance}
         onSwitchScreen={setActiveTradingScreen}
         onClose={closeTradingScreen}
+        openSetBalanceNonce={openSetBalanceNonce}
       />
 
       <PendingOrdersScreen
@@ -1302,9 +1549,11 @@ export default function App() {
         account={tradingAccount}
         selectedMarket={market}
         quotes={quotes}
-        onPlacePendingOrder={handlePlacePendingOrder}
+        initialLotSize={quickLotSize}
+        onSelectPendingOrderTypeOnChart={handleSelectPendingOrderTypeOnChart}
         onModifyPendingOrder={handleModifyPendingOrder}
         onCancelPendingOrder={handleCancelPendingOrder}
+        onOpenSetBalance={handleOpenSetBalance}
         onClose={closeTradingScreen}
       />
 
@@ -1314,22 +1563,23 @@ export default function App() {
         onClose={closeTradingScreen}
       />
 
-      {/* Triggered Price Alert Notification Toasts */}
+      {/* Triggered Price Alert & Trading Notification Toasts */}
       {triggeredToasts.length > 0 && (
         <div className="fixed top-3 right-3 z-50 flex flex-col gap-2 max-w-xs">
           {triggeredToasts.map((toast) => (
             <div
               key={toast.id}
-              className="flex items-start gap-2.5 rounded-lg border border-[#FFFFFF]/70 bg-[#101012]/95 p-3 text-[#F5F5F7] shadow-2xl backdrop-blur-md"
+              className="animate-lv-panel-in flex items-start gap-2.5 rounded-lg border border-[#FFFFFF]/70 bg-[#101012]/96 p-3 text-[#F5F5F7] shadow-2xl"
             >
               <BellRing className="w-4 h-4 text-[#FFFFFF] shrink-0 mt-0.5" />
               <div className="min-w-0 flex-1">
                 <div className="text-[11px] font-bold tracking-[0.12em] text-[#FFFFFF]">
-                  PRICE ALERT TRIGGERED · {toast.market}
+                  {toast.title ?? `PRICE ALERT TRIGGERED · ${toast.market}`}
                 </div>
                 <div className="mt-0.5 font-mono-num text-xs text-[#F5F5F7]">
-                  REACHED {formatPrice(toast.price, MARKETS[toast.market].decimals)}
-                  {toast.note ? ` · ${toast.note}` : ''}
+                  {toast.title
+                    ? toast.note
+                    : `REACHED ${formatPrice(toast.price, MARKETS[toast.market].decimals)}${toast.note ? ` · ${toast.note}` : ''}`}
                 </div>
               </div>
               <button

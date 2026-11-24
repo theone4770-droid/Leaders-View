@@ -6,6 +6,7 @@ import {
   INDICATOR_ROOT_TABS,
   IndicatorRootTab,
 } from '../modules/indicatorsManager';
+import { useAnimatedPresence } from '../hooks/useAnimatedPresence';
 
 interface IndicatorsModalProps {
   open: boolean;
@@ -13,19 +14,24 @@ interface IndicatorsModalProps {
 }
 
 export const IndicatorsModal: React.FC<IndicatorsModalProps> = React.memo(({ open, onClose }) => {
+  const { shouldRender, isClosing } = useAnimatedPresence(open, 155);
   const [search, setSearch] = useState('');
   const [activeTab, setActiveTab] = useState<IndicatorRootTab>('BUILT-IN');
   const [builtInGroup, setBuiltInGroup] = useState<BuiltInIndicatorGroup>('TECHNICAL');
 
-  if (!open) return null;
+  if (!shouldRender) return null;
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-3"
+      className={`${
+        isClosing ? 'animate-lv-fade-out pointer-events-none' : 'animate-lv-fade-in'
+      } fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-3`}
       onClick={onClose}
     >
       <div
-        className="w-full max-w-xl h-[min(460px,calc(100dvh-24px))] flex flex-col rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#0F0F12] shadow-2xl overflow-hidden"
+        className={`${
+          isClosing ? 'animate-lv-modal-out' : 'animate-lv-modal-in'
+        } w-full max-w-xl h-[min(460px,calc(100dvh-24px))] flex flex-col rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#0F0F12] shadow-2xl overflow-hidden`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Activity, Bell, Download, Rewind, X } from 'lucide-react';
+import { useAnimatedPresence } from '../hooks/useAnimatedPresence';
 
 interface ThreeDotsMenuProps {
   open: boolean;
@@ -29,15 +30,24 @@ export const ThreeDotsMenu: React.FC<ThreeDotsMenuProps> = React.memo(({
   onClose,
 }) => {
   const [showIOSGuide, setShowIOSGuide] = useState(false);
+  const menuAnim = useAnimatedPresence(open, 155);
+  const iosAnim = useAnimatedPresence(showIOSGuide, 155);
 
   const showInstallItem = !isInstalledApp && (canInstallApp || isIOS);
 
   return (
     <>
-      {open && (
-        <div className="fixed inset-0 z-40" onClick={onClose}>
+      {menuAnim.shouldRender && (
+        <div
+          className={`${
+            menuAnim.isClosing ? 'animate-lv-fade-out pointer-events-none' : 'animate-lv-fade-in'
+          } fixed inset-0 z-40`}
+          onClick={onClose}
+        >
           <div
-            className="absolute bottom-14 left-3 sm:left-56 w-52 rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#101012] p-1.5 shadow-2xl"
+            className={`${
+              menuAnim.isClosing ? 'animate-lv-modal-out' : 'animate-lv-modal-in'
+            } absolute bottom-14 left-3 sm:left-56 w-52 rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#101012] p-1.5 shadow-2xl`}
             onClick={(e) => e.stopPropagation()}
             role="menu"
             aria-label="Chart tools menu"
@@ -121,13 +131,17 @@ export const ThreeDotsMenu: React.FC<ThreeDotsMenuProps> = React.memo(({
         </div>
       )}
 
-      {showIOSGuide && (
+      {iosAnim.shouldRender && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+          className={`${
+            iosAnim.isClosing ? 'animate-lv-fade-out pointer-events-none' : 'animate-lv-fade-in'
+          } fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4`}
           onClick={() => setShowIOSGuide(false)}
         >
           <div
-            className="w-full max-w-sm rounded-xl border border-[#D4AF37]/40 bg-[#101012] p-5 text-[#F5F5F7] shadow-2xl"
+            className={`${
+              iosAnim.isClosing ? 'animate-lv-modal-out' : 'animate-lv-modal-in'
+            } w-full max-w-sm rounded-xl border border-[#D4AF37]/40 bg-[#101012] p-5 text-[#F5F5F7] shadow-2xl`}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between">

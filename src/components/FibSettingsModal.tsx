@@ -6,6 +6,7 @@ import {
   getFibRetracementLevels,
 } from '../modules/drawingEngine';
 import { saveFibSettingsPreset } from '../modules/drawingStorage';
+import { useAnimatedPresence } from '../hooks/useAnimatedPresence';
 
 interface FibSettingsModalProps {
   open: boolean;
@@ -72,9 +73,13 @@ export const FibSettingsModal: React.FC<FibSettingsModalProps> = ({
   onUpdate,
   onClose,
 }) => {
+  const { shouldRender, isClosing } = useAnimatedPresence(
+    open && drawing.toolId === 'fib_retracement',
+    155
+  );
   const [newLevelInput, setNewLevelInput] = useState('');
 
-  if (!open || drawing.toolId !== 'fib_retracement') return null;
+  if (!shouldRender || drawing.toolId !== 'fib_retracement') return null;
 
   const levels = getFibRetracementLevels(drawing);
   const showPrices = drawing.meta?.fibShowPrices !== false;
@@ -177,13 +182,17 @@ export const FibSettingsModal: React.FC<FibSettingsModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-[2px] p-3"
+      className={`${
+        isClosing ? 'animate-lv-fade-out pointer-events-none' : 'animate-lv-fade-in'
+      } fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-3`}
       onPointerDown={(e) => e.stopPropagation()}
       onClick={handleSaveAndClose}
     >
       <div
         data-testid="fib-settings-modal"
-        className="w-full max-w-md max-h-[calc(100dvh-20px)] flex flex-col rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#0F0F12] shadow-2xl overflow-y-auto select-none"
+        className={`${
+          isClosing ? 'animate-lv-modal-out' : 'animate-lv-modal-in'
+        } w-full max-w-md max-h-[calc(100dvh-20px)] flex flex-col rounded-lg border border-[#141311]/30 dark:border-[#FFFFFF]/35 bg-[#FFFFFF] dark:bg-[#0F0F12] shadow-2xl overflow-y-auto select-none`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
