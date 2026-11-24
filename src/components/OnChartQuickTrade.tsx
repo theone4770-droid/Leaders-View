@@ -371,6 +371,22 @@ export const OnChartQuickTrade: React.FC<OnChartQuickTradeProps> = React.memo(
               {quote ? formatPrice(quote.ask, decimals) : '—'}
             </span>
           </button>
+
+          {/* Right-side Freely Movable Drag Handle */}
+          <div
+            role="button"
+            tabIndex={0}
+            aria-label="Move Quick Trade Bar (Right)"
+            title="Drag to move anywhere on chart"
+            data-testid="onchart-drag-handle-right"
+            onPointerDown={handleHandlePointerDown}
+            onPointerMove={handleHandlePointerMove}
+            onPointerUp={handleHandlePointerUp}
+            onPointerCancel={handleHandlePointerUp}
+            className="flex w-6 shrink-0 items-center justify-center border-l border-white/15 bg-[#16161F] text-neutral-400 hover:text-[#D4AF37] touch-none cursor-grab active:cursor-grabbing"
+          >
+            <GripVertical className="w-3.5 h-3.5" />
+          </div>
         </div>
 
         {flashMsg && (
